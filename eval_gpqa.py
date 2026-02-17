@@ -1,3 +1,4 @@
+import argparse
 import pandas as pd
 import json
 from pathlib import Path
@@ -22,7 +23,11 @@ def eval_gpqa(fname):
     for i in range(total):
         base_correct += safe_grade((df["std_completion"][i]), df["correct_answer"][i])
         temp_correct += safe_grade((df["naive_completion"][i]), df["correct_answer"][i])
-        mcmc_correct += safe_grade((df["mcmc_completion"][i][len(df["question"][i]):]), df["correct_answer"][i])
+        if "mcmc_generated_completion" in df.columns:
+            mcmc_pred = df["mcmc_generated_completion"][i]
+        else:
+            mcmc_pred = df["mcmc_completion"][i][len(df["question"][i]):]
+        mcmc_correct += safe_grade(mcmc_pred, df["correct_answer"][i])
 
     return base_correct, temp_correct, mcmc_correct, total
 
@@ -40,9 +45,10 @@ def gpqa_results(fnames):
         mcmc_total += mcmc
         total += n
 
-    base_acc = base_total / total
-    temp_acc = temp_total / total
-    mcmc_acc = mcmc_total / total
+    denom = max(total, 1)
+    base_acc = base_total / denom
+    temp_acc = temp_total / denom
+    mcmc_acc = mcmc_total / denom
 
     print(f"Base accuracy:  {base_acc:.3f}")
     print(f"Temp accuracy:  {temp_acc:.3f}")
@@ -62,4 +68,3 @@ if __name__ == "__main__":
     folder = Path(args.folder)
     fnames = sorted(str(p) for p in folder.glob("*.csv"))
     gpqa_results(fnames)
-

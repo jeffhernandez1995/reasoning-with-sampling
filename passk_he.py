@@ -1,8 +1,9 @@
+import argparse
 import pandas as pd
 import json
 from pathlib import Path
 from typing import List, Dict, Any
-from grader_utils.he_grader import entry_point
+from grader_utils.he_grader import entry_point, extract_code
 import itertools
 import re
 from typing import List, Dict, Tuple
@@ -51,7 +52,10 @@ def fnames_to_json(grouped_fnames, output_fname, tag, data_file='data/HumanEval.
                     prompt = dataset[i + mult*idx]["prompt"]
     
                     if tag=="mcmc":
-                        response = df["mcmc_completion"][i]
+                        if "mcmc_generated_completion" in df.columns:
+                            response = prompt + df["mcmc_generated_completion"][i]
+                        else:
+                            response = df["mcmc_completion"][i]
                     elif tag=="std":
                         response = prompt + df["std_completion"][i]
                     elif tag=="naive":
@@ -88,4 +92,3 @@ if __name__ == "__main__":
     folder = Path(args.folder)
     fnames = sorted(str(p) for p in folder.glob("*.csv"))
     plot_passk(fnames, args.output_fname)
-

@@ -1,3 +1,4 @@
+import argparse
 import pandas as pd
 import json
 from pathlib import Path
@@ -15,7 +16,10 @@ def fnames_to_json(fnames, output_fname, tag):
                 prompt = df["instruction"][i]
                 
                 if tag=="mcmc":
-                    response =  df["mcmc_completion"][i][len(prompt):]
+                    if "mcmc_generated_completion" in df.columns:
+                        response = df["mcmc_generated_completion"][i]
+                    else:
+                        response = df["mcmc_completion"][i][len(prompt):]
                 elif tag=="std":
                     response = df["std_completion"][i]
                 elif tag=="naive":

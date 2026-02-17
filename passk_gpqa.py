@@ -1,7 +1,9 @@
+import argparse
 import os
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+from pathlib import Path
 from grader_utils.gpqa_grader import grade_answer, parse_answer_gpqa
 import itertools
 import re
@@ -53,7 +55,11 @@ def plot_passk(fnames):
           df = pd.read_csv(fname)
           for i in range(len(df)):
               prob_id = idx*(len(df)) + i
-              correct_by_seed[seed, prob_id] = safe_grade(df["mcmc_completion"][i][len(df["question"][i]):], df["correct_answer"][i])
+              if "mcmc_generated_completion" in df.columns:
+                  mcmc_pred = df["mcmc_generated_completion"][i]
+              else:
+                  mcmc_pred = df["mcmc_completion"][i][len(df["question"][i]):]
+              correct_by_seed[seed, prob_id] = safe_grade(mcmc_pred, df["correct_answer"][i])
               # correct_by_seed[seed, prob_id] = safe_grade(df["std_completion"][i], df["correct_answer"][i])
               # correct_by_seed[seed, prob_id] = safe_grade(df["naive_completion"][i], df["correct_answer"][i])
     

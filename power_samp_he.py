@@ -1,111 +1,109 @@
-import os
-
-from huggingface_hub import constants
-import re
-
-from contextlib import nullcontext
-from glob import glob
-import json
-import random
-from tqdm import tqdm
 import argparse
+import json
+import os
+import random
+import re
+from typing import Any
 
 import pandas as pd
-import numpy as np
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.distributed import init_process_group, destroy_process_group
-from torch.utils.data import Dataset, DataLoader
-from dataclasses import dataclass
-from datasets import Dataset, load_dataset, concatenate_datasets
-
-
 import torch
-import torch.nn as nn
-from torch.nn import functional as F
-import transformers
+from tqdm import tqdm
 
-from grader_utils.parse_utils import parse_answer
-from constants import *
-from power_samp_utils import *
+from sampling_runtime import GenericSampler, WandbSampleLogger, load_model_and_tokenizer
+
+
+def parse_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "t", "yes", "y"}
+
+
+def truncate_text(text: str, max_chars: int = 1200) -> str:
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + "..."
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--save_str", action = "store", type = str, default = "results/",  dest = "save_str")
-    parser.add_argument("--model", action = "store", default = "qwen", type = str, choices = ["qwen", "qwen_math", "phi", "tulu", "qwen_grpo", "qwen_math_grpo", "phi_grpo"])
-    parser.add_argument("--temperature", action = "store", default = 0.5, type = float, dest = "temperature")
-    parser.add_argument("--dataset", action = "store", default = "HUMANEVAL", type = str)
-    parser.add_argument("--cot", action = "store", type = bool, default = True)
-    parser.add_argument("--type", action = "store", type = str, default = "chat", choices = ["chat"])
-    parser.add_argument("--mcmc_steps", action = "store", type = int, default = 10)
-    parser.add_argument("--device", action = "store", type = str, dest = "device", default = "cuda" if torch.cuda.is_available() else 'cpu')
-    parser.add_argument("--batch_idx", action = "store", type = int, default = 0)
-    parser.add_argument("--seed", action = "store", type = int, default = 0)
+    parser.add_argument("--save_str", type=str, default="results/")
+    parser.add_argument(
+        "--model",
+        default="qwen",
+        type=str,
+        choices=["qwen", "qwen_math", "phi", "tulu", "qwen_grpo", "qwen_math_grpo", "phi_grpo"],
+    )
+    parser.add_argument("--temperature", "--temp", dest="temperature", type=float, default=0.5)
+    parser.add_argument("--dataset", type=str, default="HUMANEVAL")
+    parser.add_argument("--cot", type=parse_bool, default=True)
+    parser.add_argument("--type", type=str, default="chat", choices=["chat"])
+    parser.add_argument("--mcmc_steps", type=int, default=10)
+    parser.add_argument("--sampling_method", type=str, default="power", choices=["power"])
+    parser.add_argument("--max_new_tokens", type=int, default=3072)
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--batch_idx", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--local_files_only", type=parse_bool, default=True)
+    parser.add_argument("--wandb_project", type=str, default=None)
+    parser.add_argument("--wandb_entity", type=str, default=None)
+    parser.add_argument("--wandb_run_name", type=str, default=None)
+    parser.add_argument("--wandb_log_samples", type=int, default=20)
     args = parser.parse_args()
 
-    random.seed(0)
+    random.seed(args.seed)
 
+    if args.dataset != "HUMANEVAL":
+        raise ValueError(f"Unsupported dataset: {args.dataset}")
 
-    model = args.model
-    device = args.device
-    dataset_name = args.dataset
-    cot = args.cot
-    temp = args.temperature
-    mcmc_steps = args.mcmc_steps
-
-    save_str = os.path.join(args.save_str, model)
+    save_str = os.path.join(args.save_str, args.model)
     os.makedirs(save_str, exist_ok=True)
 
+    with open("data/HumanEval.jsonl", "r", encoding="utf-8") as f:
+        dataset = [json.loads(line) for line in f if line.strip()]
 
-    print(model)
-    print(device)
-    print(mcmc_steps)
-    if model == "qwen":
-        model_str = "Qwen/Qwen2.5-7B"
-    elif model == "qwen_math":
-        model_str = "Qwen/Qwen2.5-Math-7B"
-    elif model == "qwen_math_grpo":
-        model_str = "stellalisy/rethink_rlvr_reproduce-ground_truth-qwen2.5_math_7b-lr5e-7-kl0.00-step150"
-    elif model == "phi":
-        model_str = 'microsoft/Phi-3.5-mini-instruct'
-    elif model == "tulu":
-        model_str = "allenai/Llama-3.1-Tulu-3-8B-DPO"
+    model, tokenizer = load_model_and_tokenizer(
+        args.model,
+        args.device,
+        trust_remote_code=False,
+        local_files_only=args.local_files_only,
+    )
+    sampler = GenericSampler(model, tokenizer, args.device)
 
-    if dataset_name == "HUMANEVAL":
-        json_file = 'data/HumanEval.jsonl'
-        with open(json_file, "r", encoding="utf-8") as f:
-            dataset = [json.loads(line) for line in f if line.strip()]
+    wandb_logger = WandbSampleLogger(
+        project=args.wandb_project,
+        entity=args.wandb_entity,
+        run_name=args.wandb_run_name,
+        sample_log_limit=args.wandb_log_samples,
+        config={
+            "dataset": args.dataset,
+            "model": args.model,
+            "temperature": args.temperature,
+            "mcmc_steps": args.mcmc_steps,
+            "sampling_method": args.sampling_method,
+            "batch_idx": args.batch_idx,
+            "seed": args.seed,
+            "max_new_tokens": args.max_new_tokens,
+            "local_files_only": args.local_files_only,
+        },
+    )
 
+    start = 41 * args.batch_idx
+    end = min(41 * (args.batch_idx + 1), len(dataset))
 
-
-
-    print("dataset done")
-
-    config = transformers.AutoConfig.from_pretrained(model_str, trust_remote_code=False, local_files_only=True)
-    tokenizer = transformers.AutoTokenizer.from_pretrained(model_str, trust_remote_code=False, local_files_only=True)
-    hf_model = transformers.AutoModelForCausalLM.from_pretrained(model_str, config=config, torch_dtype="auto", device_map="auto", trust_remote_code=False, local_files_only=True).to(device)
-
-    autoreg_sampler = AutoregressiveSampler(hf_model, tokenizer, device)
-
-    print("loaded models")
     results = []
+    total_power_seconds = 0.0
+    total_power_samples = 0
 
-    start = 41*args.batch_idx
-    end = 41*(args.batch_idx+1)
-
-    for problem, data in tqdm(enumerate(dataset[start:end]), desc = "Benchmark on HumanEval"):
+    for step_idx, data in enumerate(tqdm(dataset[start:end], desc="Benchmark on HumanEval")):
         prompt = data["prompt"]
         task_id = data["task_id"]
 
-        if model == "phi" or model == "phi_grpo":
-            signature = re.search(
-                rf"def\s+({data['entry_point']}.*?):\s*\n", data["prompt"]
-            ).group(1)
+        if args.model in {"phi", "phi_grpo"}:
+            signature = re.search(rf"def\\s+({data['entry_point']}.*?):\\s*\\n", data["prompt"]).group(1)
             description = "\n".join(
                 [
                     line.strip()
-                    for line in re.search(
-                        rf"(?:\"\"\"|''')(.*?)(?:\"\"\"|''')", data["prompt"], re.DOTALL
-                    )
+                    for line in re.search(rf"(?:\"\"\"|''')(.*?)(?:\"\"\"|''')", data["prompt"], re.DOTALL)
                     .group(1)
                     .split("\n")
                 ]
@@ -115,88 +113,83 @@ if __name__ == "__main__":
                 f"{description}\n"
                 f"{data['prompt']}"
             )
-
         else:
             input_text = prompt
 
-        print(input_text)
+        input_ids = tokenizer.encode(input_text, return_tensors="pt").to(args.device)
 
+        naive_sample = sampler.sample_temperature(
+            input_ids=input_ids,
+            temperature=args.temperature,
+            max_new_tokens=args.max_new_tokens,
+        )
+        std_sample = sampler.sample_standard(input_ids=input_ids, max_new_tokens=args.max_new_tokens)
+        method_sample = sampler.sample_method(
+            input_ids=input_ids,
+            method=args.sampling_method,
+            temperature=args.temperature,
+            mcmc_steps=args.mcmc_steps,
+            max_new_tokens=args.max_new_tokens,
+        )
 
-        input_ids = tokenizer.encode(input_text, return_tensors="pt").to(device)
-        prefx = [idx.item() for idx in input_ids[0]]
+        power_seconds = method_sample.latency_seconds
+        acceptance_ratio = method_sample.metadata.get("acceptance_ratio")
+        total_power_seconds += power_seconds
+        total_power_samples += 1
+        avg_power_seconds = total_power_seconds / max(total_power_samples, 1)
 
+        results.append(
+            {
+                "question": prompt,
+                "id": task_id,
+                "naive_completion": naive_sample.completion,
+                "std_completion": std_sample.completion,
+                "mcmc_completion": method_sample.full_completion or method_sample.completion,
+                "mcmc_generated_completion": method_sample.completion,
+                "sampling_method": args.sampling_method,
+                "power_sampling_seconds": power_seconds,
+                "power_sampling_avg_seconds_so_far": avg_power_seconds,
+                "power_acceptance_ratio": acceptance_ratio,
+            }
+        )
 
-        naive_temp_output = hf_model.generate(input_ids, max_new_tokens=3072, 
-                                return_dict_in_generate=True, output_scores=True, do_sample = True, temperature = temp)
-        
-        print(tokenizer.decode(naive_temp_output[0][:, len(input_ids[0]):].squeeze().to("cpu"), skip_special_tokens=True))
-        print("naive done")
-        
-        
-        std_output = hf_model.generate(input_ids, max_new_tokens=3072, 
-                                return_dict_in_generate=True, output_scores=True, do_sample = True)
-        
-        print(tokenizer.decode(std_output[0][:, len(input_ids[0]):].squeeze().to("cpu"), skip_special_tokens=True))
-        print("std done")
+        wandb_logger.log_metrics(
+            {
+                "latency/power_sampling_seconds": power_seconds,
+                "latency/power_sampling_avg_seconds": avg_power_seconds,
+                "sampling/acceptance_ratio": acceptance_ratio,
+                "tokens/naive": len(naive_sample.token_ids),
+                "tokens/std": len(std_sample.token_ids),
+                "tokens/mcmc": len(method_sample.token_ids),
+            },
+            step=step_idx,
+        )
+        wandb_logger.log_sample(
+            {
+                "dataset_index": start + step_idx,
+                "task_id": task_id,
+                "prompt": truncate_text(prompt),
+                "naive_completion": truncate_text(naive_sample.completion),
+                "std_completion": truncate_text(std_sample.completion),
+                "mcmc_completion": truncate_text(method_sample.completion),
+                "power_sampling_seconds": power_seconds,
+                "power_acceptance_ratio": acceptance_ratio,
+            }
+        )
 
-        mcmc_temp_output, _, _, acceptance_ratio = mcmc_power_samp(autoreg_sampler, prefx, temp, mcmc_steps, max_new_tokens=3072)
+    output_path = os.path.join(
+        save_str,
+        f"{args.model}_he_base_power_samp_results_{args.mcmc_steps}_{args.temperature}_{args.batch_idx}_{args.seed}.csv",
+    )
+    pd.DataFrame(results).to_csv(output_path, index=False)
 
-        print(len(std_output))
-        print(len(naive_temp_output))
-        print(len(mcmc_temp_output))
-        print(tokenizer.decode(torch.tensor([mcmc_temp_output], dtype=torch.long, device=device).squeeze().to("cpu"), skip_special_tokens=True))
-        print("mcmc done")
+    avg_power_seconds = total_power_seconds / max(total_power_samples, 1)
+    print(f"Saved results to: {output_path}")
+    print(f"Average power sampling time per sample: {avg_power_seconds:.4f} seconds")
 
-        naive_generated_ids = naive_temp_output[0][:, len(input_ids[0]):].squeeze().to("cpu")
-        std_generated_ids = std_output[0][:, len(input_ids[0]):].squeeze().to("cpu")
-        mcmc_temp_ids = torch.tensor([mcmc_temp_output], dtype=torch.long, device=device).squeeze().to("cpu")
-
-        naive_completion = tokenizer.decode(naive_generated_ids, skip_special_tokens=True)
-        std_completion = tokenizer.decode(std_generated_ids, skip_special_tokens=True)
-        mcmc_completion = tokenizer.decode(mcmc_temp_ids, skip_special_tokens=True)
-
-        naive_answer = parse_answer(naive_completion)
-        std_answer = parse_answer(std_completion)
-        mcmc_answer = parse_answer(mcmc_completion)
-        
-        print(f'Acceptance: {acceptance_ratio}')
-
-
-        results.append({
-            "question": prompt,
-            "id": task_id,
-            "naive_completion": naive_completion,
-            "std_completion": std_completion,
-            "mcmc_completion": mcmc_completion,
-        })
-
-    
-    df = pd.DataFrame(results)
-    df.to_csv(os.path.join(save_str, model+"_he_base_power_samp_results_" + str(mcmc_steps) + "_" + str(temp) + "_" + str(args.batch_idx)  + "_" + str(args.seed) + ".csv"), index=False)
-    
-
-
-
-
-
-
-
-
-
-
-
-
-        
-
-
-
-
-
-
-
-
-
-
-
-
-
+    wandb_logger.finish(
+        summary={
+            "summary/num_samples": total_power_samples,
+            "summary/avg_power_sampling_seconds": avg_power_seconds,
+        }
+    )
