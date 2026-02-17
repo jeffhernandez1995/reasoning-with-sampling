@@ -98,31 +98,57 @@ def naive_temp(p : AutoregressiveSampler, context, temp, seq_len):
     return prop, log_probs_norm, log_probs_unnorm
 
 
+def _log_sampler_setup(method_name, temp, max_new_tokens, block_num, jump_size, mcmc_steps, context_len):
+    alpha = float("inf") if temp == 0 else 1 / temp
+    print(
+        f"[{method_name}] setup: temp={temp} alpha={alpha} "
+        f"max_new_tokens={max_new_tokens} block_num={block_num} "
+        f"jump_size={jump_size} mcmc_steps={mcmc_steps} context_len={context_len}",
+        flush=True,
+    )
+
+
+def _log_block_summary(method_name, block_idx, block_num, attempts, acceptances, context_len, seq_len, max_new_tokens):
+    acceptance_ratio = acceptances / max(attempts, 1)
+    generated_tokens = max(seq_len - context_len, 0)
+    print(
+        f"[{method_name}] block={block_idx}/{block_num} "
+        f"generated={generated_tokens}/{max_new_tokens} "
+        f"attempts={attempts} accepts={acceptances} acceptance_ratio={acceptance_ratio:.3f}",
+        flush=True,
+    )
+
+
 # alpha = infty power sampling; temp is for proposal distribution
 def max_swap(p : AutoregressiveSampler, context, temp, mcmc_steps, max_new_tokens, block_num=16):
     c = len(context)
-    print(f'Temp: {temp}')
     gen = []
     if context is not None:
         gen = context.copy()
     log_probs_norm = []
     log_probs_unnorm = []
 
-
-    print(max_new_tokens)
     assert max_new_tokens % block_num == 0
     jump_size = int(max_new_tokens // block_num)
-    print(jump_size)
+    _log_sampler_setup(
+        method_name="max_swap",
+        temp=temp,
+        max_new_tokens=max_new_tokens,
+        block_num=block_num,
+        jump_size=jump_size,
+        mcmc_steps=mcmc_steps,
+        context_len=c,
+    )
     attempts = 0
     acceptances = 0
 
 
-    for _ in tqdm(range(block_num)):
+    for block_idx in tqdm(range(block_num), desc="max_swap blocks", leave=False):
         gen, lp_norm, lp_unnorm = naive_temp(p, gen, temp=temp, seq_len=jump_size+len(gen))
         log_probs_norm.extend(lp_norm)
         log_probs_unnorm.extend(lp_unnorm)
 
-        for _ in tqdm(range(mcmc_steps)):
+        for _ in tqdm(range(mcmc_steps), desc=f"max_swap block {block_idx + 1}/{block_num}", leave=False):
             attempts+=1
             t = len(gen)
             idx = random.randint(c, t-1)
@@ -145,42 +171,50 @@ def max_swap(p : AutoregressiveSampler, context, temp, mcmc_steps, max_new_token
                 del log_prob_prop
                 del target_log_prob_cur
 
+        _log_block_summary("max_swap", block_idx + 1, block_num, attempts, acceptances, c, len(gen), max_new_tokens)
+
         if p.tokenizer.eos_token_id in gen:
             eos_idx = gen.index(p.tokenizer.eos_token_id)
             gen = gen[:eos_idx + 1]
             log_probs_norm = log_probs_norm[:eos_idx + 1]
             log_probs_unnorm = log_probs_unnorm[:eos_idx + 1]
-            acceptance_ratio = acceptances/attempts
+            print(f"[max_swap] stopped early due to EOS at block {block_idx + 1}/{block_num}", flush=True)
+            acceptance_ratio = acceptances / max(attempts, 1)
             return gen, log_probs_norm, log_probs_unnorm, acceptance_ratio
 
-    acceptance_ratio = acceptances/attempts
+    acceptance_ratio = acceptances / max(attempts, 1)
     return gen, log_probs_norm, log_probs_unnorm, acceptance_ratio
 
 # power sampling with autoregressive mcmc
 def mcmc_power_samp(p : AutoregressiveSampler, context, temp, mcmc_steps, max_new_tokens, block_num=16):
     c = len(context)
-    print(f'alpha: {1/temp}')
     gen = []
     if context is not None:
         gen = context.copy()
     log_probs_norm = []
     log_probs_unnorm = []
 
-
-    print(max_new_tokens)
     assert max_new_tokens % block_num == 0
     jump_size = int(max_new_tokens // block_num)
-    print(jump_size)
+    _log_sampler_setup(
+        method_name="power_samp",
+        temp=temp,
+        max_new_tokens=max_new_tokens,
+        block_num=block_num,
+        jump_size=jump_size,
+        mcmc_steps=mcmc_steps,
+        context_len=c,
+    )
     attempts = 0
     acceptances = 0
 
 
-    for _ in tqdm(range(block_num)):
+    for block_idx in tqdm(range(block_num), desc="power_samp blocks", leave=False):
         gen, lp_norm, lp_unnorm = naive_temp(p, gen, temp=temp, seq_len=jump_size+len(gen))
         log_probs_norm.extend(lp_norm)
         log_probs_unnorm.extend(lp_unnorm)
 
-        for _ in tqdm(range(mcmc_steps)):
+        for _ in tqdm(range(mcmc_steps), desc=f"power_samp block {block_idx + 1}/{block_num}", leave=False):
             attempts+=1
             t = len(gen)
             idx = random.randint(c, t-1)
@@ -203,15 +237,18 @@ def mcmc_power_samp(p : AutoregressiveSampler, context, temp, mcmc_steps, max_ne
                 del log_prob_prop
                 del target_log_prob_cur
 
+        _log_block_summary("power_samp", block_idx + 1, block_num, attempts, acceptances, c, len(gen), max_new_tokens)
+
         if p.tokenizer.eos_token_id in gen:
             eos_idx = gen.index(p.tokenizer.eos_token_id)
             gen = gen[:eos_idx + 1]
             log_probs_norm = log_probs_norm[:eos_idx + 1]
             log_probs_unnorm = log_probs_unnorm[:eos_idx + 1]
-            acceptance_ratio = acceptances/attempts
+            print(f"[power_samp] stopped early due to EOS at block {block_idx + 1}/{block_num}", flush=True)
+            acceptance_ratio = acceptances / max(attempts, 1)
             return gen, log_probs_norm, log_probs_unnorm, acceptance_ratio
 
-    acceptance_ratio = acceptances/attempts
+    acceptance_ratio = acceptances / max(attempts, 1)
     return gen, log_probs_norm, log_probs_unnorm, acceptance_ratio
 
 

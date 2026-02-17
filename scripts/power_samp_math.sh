@@ -43,7 +43,11 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-max_split_size_mb:256
 
 # --- Paths / run params ---
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+if [[ -n "${SLURM_SUBMIT_DIR:-}" && -f "${SLURM_SUBMIT_DIR}/power_samp_math.py" ]]; then
+  REPO_ROOT="${SLURM_SUBMIT_DIR}"
+else
+  REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+fi
 cd "${REPO_ROOT}"
 mkdir -p "/scratch/$USER/logs" "${HF_HOME}"
 
@@ -58,13 +62,15 @@ hostname
 echo "SLURM_JOB_ID=${SLURM_JOB_ID} ARRAY_TASK=${SLURM_ARRAY_TASK_ID}"
 echo "BATCH_IDX=${BATCH_IDX} SEED=${SEED}"
 echo "MODEL=${MODEL} MCMC_STEPS=${MCMC_STEPS} TEMP=${TEMP}"
+echo "REPO_ROOT=${REPO_ROOT}"
 echo "SAVE_STR=${SAVE_STR}"
 echo
 
 srun --ntasks=1 bash -lc "
 source \"\$(conda info --base)/etc/profile.d/conda.sh\" &&
 conda activate psamp &&
-python power_samp_math.py \
+cd \"${REPO_ROOT}\" &&
+python \"${REPO_ROOT}/power_samp_math.py\" \
   --batch_idx \"${BATCH_IDX}\" \
   --mcmc_steps \"${MCMC_STEPS}\" \
   --temp \"${TEMP}\" \
