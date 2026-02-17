@@ -1,5 +1,6 @@
 import json
 import math
+import os
 from dataclasses import dataclass, field
 from numbers import Number
 from time import perf_counter
@@ -189,6 +190,10 @@ class WandbSampleLogger:
         self._wandb = None
         self._run = None
 
+        project = project or None
+        entity = entity or None
+        run_name = run_name or None
+
         if not project:
             return
 
@@ -213,6 +218,14 @@ class WandbSampleLogger:
                 clean_metrics[key] = float(value)
         if clean_metrics:
             self._wandb.log(clean_metrics, step=step)
+
+    def log_file(self, file_path: str):
+        if not self.enabled or not os.path.exists(file_path):
+            return
+        try:
+            self._wandb.save(file_path, policy="now")
+        except Exception as exc:
+            print(f"W&B file upload skipped for {file_path}: {exc}")
 
     def log_sample(self, sample: Dict[str, Any]):
         if not self.enabled or len(self.sample_rows) >= self.sample_log_limit:

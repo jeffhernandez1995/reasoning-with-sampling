@@ -44,9 +44,9 @@ if __name__ == "__main__":
     parser.add_argument("--batch_idx", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--local_files_only", type=parse_bool, default=True)
-    parser.add_argument("--wandb_project", type=str, default=None)
-    parser.add_argument("--wandb_entity", type=str, default=None)
-    parser.add_argument("--wandb_run_name", type=str, default=None)
+    parser.add_argument("--wandb_project", type=str, default=os.environ.get("WANDB_PROJECT", "reasoning-with-sampling"))
+    parser.add_argument("--wandb_entity", type=str, default=os.environ.get("WANDB_ENTITY"))
+    parser.add_argument("--wandb_run_name", type=str, default=os.environ.get("WANDB_RUN_NAME"))
     parser.add_argument("--wandb_log_samples", type=int, default=20)
     args = parser.parse_args()
 
@@ -182,6 +182,7 @@ if __name__ == "__main__":
         f"{args.model}_he_base_power_samp_results_{args.mcmc_steps}_{args.temperature}_{args.batch_idx}_{args.seed}.csv",
     )
     pd.DataFrame(results).to_csv(output_path, index=False)
+    wandb_logger.log_file(output_path)
 
     avg_power_seconds = total_power_seconds / max(total_power_samples, 1)
     print(f"Saved results to: {output_path}")
