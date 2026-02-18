@@ -55,7 +55,7 @@ def plot_passk(fnames):
           df = pd.read_csv(fname)
           for i in range(len(df)):
               prob_id = idx*(len(df)) + i
-              correct_by_seed[seed, prob_id] = safe_grade(df["mcmc_answer"][i], df["correct_answer"][i])
+              correct_by_seed[seed, prob_id] = safe_grade_math(df["mcmc_answer"][i], df["correct_answer"][i])
               # correct_by_seed[seed, prob_id] = safe_grade(df["std_answer"][i], df["correct_answer"][i])
               # correct_by_seed[seed, prob_id] = safe_grade(df["naive_answer"][i], df["correct_answer"][i])
     

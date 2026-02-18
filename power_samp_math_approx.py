@@ -81,7 +81,7 @@ if __name__ == "__main__":
     if args.dataset != "MATH":
         raise ValueError(f"Unsupported dataset: {args.dataset}")
 
-    save_str = os.path.join(args.save_str, args.model)
+    save_str = os.path.join(args.save_str, args.sampling_method, args.model)
     os.makedirs(save_str, exist_ok=True)
 
     with open("data/MATH500.json", "r") as f:
@@ -128,6 +128,8 @@ if __name__ == "__main__":
     end = min(100 * (args.batch_idx + 1), len(dataset))
 
     results = []
+    total_base_seconds = 0.0
+    total_temp_seconds = 0.0
     total_approx_seconds = 0.0
     total_approx_samples = 0
 
@@ -161,9 +163,15 @@ if __name__ == "__main__":
         std_reward = safe_grade(std_answer, answer)
         method_reward = safe_grade(method_answer, answer)
 
+        base_seconds = std_sample.latency_seconds
+        temp_seconds = naive_sample.latency_seconds
         approx_seconds = method_sample.latency_seconds
+        total_base_seconds += base_seconds
+        total_temp_seconds += temp_seconds
         total_approx_seconds += approx_seconds
         total_approx_samples += 1
+        avg_base_seconds = total_base_seconds / max(total_approx_samples, 1)
+        avg_temp_seconds = total_temp_seconds / max(total_approx_samples, 1)
         avg_approx_seconds = total_approx_seconds / max(total_approx_samples, 1)
 
         approx_rollouts = method_sample.metadata.get("rollouts")
@@ -183,6 +191,10 @@ if __name__ == "__main__":
                 "mcmc_generated_completion": method_sample.completion,
                 "mcmc_answer": method_answer,
                 "sampling_method": args.sampling_method,
+                "base_sampling_seconds": base_seconds,
+                "base_sampling_avg_seconds_so_far": avg_base_seconds,
+                "temp_sampling_seconds": temp_seconds,
+                "temp_sampling_avg_seconds_so_far": avg_temp_seconds,
                 "power_sampling_seconds": approx_seconds,
                 "power_sampling_avg_seconds_so_far": avg_approx_seconds,
                 "power_acceptance_ratio": None,
@@ -198,6 +210,10 @@ if __name__ == "__main__":
 
         wandb_logger.log_metrics(
             {
+                "latency/base_sampling_seconds": base_seconds,
+                "latency/base_sampling_avg_seconds": avg_base_seconds,
+                "latency/temp_sampling_seconds": temp_seconds,
+                "latency/temp_sampling_avg_seconds": avg_temp_seconds,
                 "latency/power_sampling_seconds": approx_seconds,
                 "latency/power_sampling_avg_seconds": avg_approx_seconds,
                 "sampling/approx_steps": approx_steps,
@@ -220,6 +236,8 @@ if __name__ == "__main__":
                 "naive_reward": naive_reward,
                 "std_reward": std_reward,
                 "mcmc_reward": method_reward,
+                "base_sampling_seconds": base_seconds,
+                "temp_sampling_seconds": temp_seconds,
                 "power_sampling_seconds": approx_seconds,
                 "approx_steps": approx_steps,
                 "approx_rollouts": approx_rollouts,
@@ -237,13 +255,19 @@ if __name__ == "__main__":
     pd.DataFrame(results).to_csv(output_path, index=False)
     wandb_logger.log_file(output_path)
 
+    avg_base_seconds = total_base_seconds / max(total_approx_samples, 1)
+    avg_temp_seconds = total_temp_seconds / max(total_approx_samples, 1)
     avg_approx_seconds = total_approx_seconds / max(total_approx_samples, 1)
     print(f"Saved results to: {output_path}")
+    print(f"Average base sampling time per sample: {avg_base_seconds:.4f} seconds")
+    print(f"Average temp sampling time per sample: {avg_temp_seconds:.4f} seconds")
     print(f"Average power_approx sampling time per sample: {avg_approx_seconds:.4f} seconds")
 
     wandb_logger.finish(
         summary={
             "summary/num_samples": total_approx_samples,
+            "summary/avg_base_sampling_seconds": avg_base_seconds,
+            "summary/avg_temp_sampling_seconds": avg_temp_seconds,
             "summary/avg_power_sampling_seconds": avg_approx_seconds,
         }
     )
