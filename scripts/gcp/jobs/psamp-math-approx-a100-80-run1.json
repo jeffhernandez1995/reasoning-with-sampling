@@ -1,0 +1,86 @@
+{
+  "taskGroups": [
+    {
+      "taskSpec": {
+        "runnables": [
+          {
+            "container": {
+              "imageUri": "us-east1-docker.pkg.dev/tti-rava-vicenteor/rws/psamp:v1",
+              "entrypoint": "bash",
+              "commands": [
+                "-lc",
+                "chmod +x /app/scripts/gcp/power_samp_math_approx_batch_task.sh && /app/scripts/gcp/power_samp_math_approx_batch_task.sh"
+              ]
+            }
+          }
+        ],
+        "computeResource": {
+          "cpuMilli": 12000,
+          "memoryMib": 160000,
+          "bootDiskMib": 150000
+        },
+        "maxRunDuration": "86400s",
+        "maxRetryCount": 1,
+        "volumes": [
+          {
+            "gcs": {
+              "remotePath": "tti-rava-vicenteor-rws"
+            },
+            "mountPath": "/mnt/disks/rws"
+          }
+        ],
+        "environment": {
+          "variables": {
+            "REPO_ROOT": "/app",
+            "SAVE_STR": "/mnt/disks/rws/results",
+            "MODEL": "qwen_math",
+            "TEMP": "0.25",
+            "TOP_K": "8",
+            "CANDIDATE_POOL_SIZE": "32",
+            "ROLLOUTS_PER_CANDIDATE": "8",
+            "LOOKAHEAD_TOKENS": "",
+            "BLOCK_SIZE": "1",
+            "USE_JACKKNIFE": "true",
+            "NUM_SHARDS": "5",
+            "NUM_SEEDS": "8",
+            "OMP_NUM_THREADS": "12",
+            "WANDB_PROJECT": "reasoning-with-sampling",
+            "WANDB_ENTITY": "",
+            "HF_HOME": "/tmp/hf_home",
+            "HF_HUB_CACHE": "/tmp/hf_home/hub",
+            "HF_DATASETS_CACHE": "/tmp/hf_home/datasets",
+            "TRANSFORMERS_CACHE": "/tmp/hf_home/models",
+            "HF_HUB_DISABLE_XET": "1",
+            "HF_ALLOW_CODE_EVAL": "1",
+            "HF_DATASETS_TRUST_REMOTE_CODE": "True",
+            "TOKENIZERS_PARALLELISM": "false",
+            "NCCL_DEBUG": "WARN",
+            "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:256",
+            "CUDA_VISIBLE_DEVICES": "0"
+          }
+        }
+      },
+      "taskCount": 40,
+      "parallelism": 4
+    }
+  ],
+  "allocationPolicy": {
+    "instances": [
+      {
+        "installGpuDrivers": true,
+        "policy": {
+          "machineType": "a2-ultragpu-1g",
+          "provisioningModel": "STANDARD"
+        }
+      }
+    ],
+    "location": {
+      "allowedLocations": [
+        "regions/us-east1"
+      ]
+    }
+  },
+  "logsPolicy": {
+    "destination": "CLOUD_LOGGING"
+  }
+}

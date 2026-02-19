@@ -19,9 +19,12 @@ Optional:
   --parallelism <int>                       (default depends on profile)
   --provisioning-model <STANDARD|SPOT|FLEX_START>
   --allowed-locations <csv>                 (default: regions/<region>)
+  --network <vpc-name>                      (optional; auto-detected if omitted)
+  --subnetwork <subnet-name>                (optional; region subnet)
   --max-run-duration <seconds+s>            (default: 86400s)
   --hf-secret <secret-version-resource>     (optional Secret Manager version path)
   --wandb-secret <secret-version-resource>  (optional Secret Manager version path)
+  --skip-machine-check                      (skip regional machine-type availability check)
   --dry-run                                 (generate JSON only, do not submit)
 
 Experiment overrides (all optional):
@@ -81,6 +84,8 @@ TASK_COUNT="${TASK_COUNT:-40}"
 PARALLELISM="${PARALLELISM:-}"
 PROVISIONING_MODEL="${PROVISIONING_MODEL:-}"
 ALLOWED_LOCATIONS="${ALLOWED_LOCATIONS:-}"
+NETWORK_NAME="${NETWORK_NAME:-}"
+SUBNETWORK_NAME="${SUBNETWORK_NAME:-}"
 MAX_RUN_DURATION="${MAX_RUN_DURATION:-86400s}"
 HF_SECRET="${HF_SECRET:-}"
 WANDB_SECRET="${WANDB_SECRET:-}"
@@ -99,6 +104,7 @@ NUM_SEEDS="${NUM_SEEDS:-8}"
 WANDB_PROJECT="${WANDB_PROJECT:-reasoning-with-sampling}"
 WANDB_ENTITY="${WANDB_ENTITY:-}"
 OMP_NUM_THREADS="${OMP_NUM_THREADS:-}"
+SKIP_MACHINE_CHECK=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -140,6 +146,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --allowed-locations)
       ALLOWED_LOCATIONS="$2"
+      shift 2
+      ;;
+    --network)
+      NETWORK_NAME="$2"
+      shift 2
+      ;;
+    --subnetwork)
+      SUBNETWORK_NAME="$2"
       shift 2
       ;;
     --max-run-duration)
@@ -201,6 +215,10 @@ while [[ $# -gt 0 ]]; do
     --wandb-entity)
       WANDB_ENTITY="$2"
       shift 2
+      ;;
+    --skip-machine-check)
+      SKIP_MACHINE_CHECK=1
+      shift
       ;;
     --dry-run)
       DRY_RUN=1
@@ -293,6 +311,82 @@ if [[ -z "${ALLOWED_LOCATIONS}" ]]; then
   ALLOWED_LOCATIONS="regions/${REGION}"
 fi
 
+if (( SKIP_MACHINE_CHECK == 0 )); then
+  if ! gcloud compute machine-types list \
+    --filter="name=${MACHINE_TYPE} AND zone~^${REGION}-" \
+    --format='value(name)' \
+    --limit=1 | grep -q .; then
+    AVAILABLE_GPU_TYPES="$(
+      gcloud compute machine-types list \
+        --filter="zone~^${REGION}- AND name~'^(a2|a3)-.*gpu-'" \
+        --format='value(name)' \
+        | sort -u \
+        | tr '\n' ',' \
+        | sed 's/,$//'
+    )"
+    if [[ -z "${AVAILABLE_GPU_TYPES}" ]]; then
+      AVAILABLE_GPU_TYPES="(none detected)"
+    fi
+    die "Machine type '${MACHINE_TYPE}' is not available in region '${REGION}' for this project. Available GPU machine types in ${REGION}: ${AVAILABLE_GPU_TYPES}. Use --skip-machine-check to bypass this validation."
+  fi
+fi
+
+if [[ -n "${SUBNETWORK_NAME}" && -z "${NETWORK_NAME}" ]]; then
+  die "--subnetwork requires --network"
+fi
+
+if [[ -z "${NETWORK_NAME}" ]]; then
+  # If default VPC is missing, auto-pick a subnet in target region.
+  if ! gcloud compute networks describe default --project="${PROJECT_ID}" >/dev/null 2>&1; then
+    subnet_line="$(
+      gcloud compute networks subnets list \
+        --project="${PROJECT_ID}" \
+        --regions="${REGION}" \
+        --format='csv[no-heading](name,network.basename())' \
+        --limit=1
+    )"
+    if [[ -n "${subnet_line}" ]]; then
+      SUBNETWORK_NAME="$(echo "${subnet_line}" | cut -d, -f1)"
+      NETWORK_NAME="$(echo "${subnet_line}" | cut -d, -f2)"
+    else
+      die "No default VPC and no subnet found in region '${REGION}'. Create a subnet in this region, pass --network/--subnetwork, or use another region."
+    fi
+  fi
+fi
+
+if [[ -n "${NETWORK_NAME}" && -z "${SUBNETWORK_NAME}" ]]; then
+  SUBNETWORK_NAME="$(
+    gcloud compute networks subnets list \
+      --project="${PROJECT_ID}" \
+      --regions="${REGION}" \
+      --filter="network.basename()=${NETWORK_NAME}" \
+      --format='value(name)' \
+      --limit=1
+  )"
+  [[ -n "${SUBNETWORK_NAME}" ]] || die "No subnet for network '${NETWORK_NAME}' in region '${REGION}'. Pass --subnetwork explicitly or choose a compatible region."
+fi
+
+NETWORK_POLICY_JSON='{}'
+if [[ -n "${NETWORK_NAME}" && -n "${SUBNETWORK_NAME}" ]]; then
+  NETWORK_POLICY_JSON="$(
+    jq -cn \
+      --arg project "${PROJECT_ID}" \
+      --arg network "${NETWORK_NAME}" \
+      --arg region "${REGION}" \
+      --arg subnet "${SUBNETWORK_NAME}" \
+      '{
+        network: {
+          networkInterfaces: [
+            {
+              network: ("projects/" + $project + "/global/networks/" + $network),
+              subnetwork: ("projects/" + $project + "/regions/" + $region + "/subnetworks/" + $subnet)
+            }
+          ]
+        }
+      }'
+  )"
+fi
+
 if [[ -z "${JOB_NAME}" ]]; then
   JOB_NAME="psamp-math-approx-${PROFILE}-$(date +%Y%m%d-%H%M%S)"
 fi
@@ -368,6 +462,7 @@ jq -n \
   --argjson memory_mib "${MEMORY_MIB}" \
   --argjson boot_disk_mib "${BOOT_DISK_MIB}" \
   --argjson location_policy "${LOCATION_POLICY_JSON}" \
+  --argjson network_policy "${NETWORK_POLICY_JSON}" \
   --argjson secret_variables "${SECRET_JSON}" \
   '
   {
@@ -445,15 +540,16 @@ jq -n \
         {
           instances: [
             {
+              installGpuDrivers: true,
               policy: {
                 machineType: $machine_type,
-                provisioningModel: $provisioning_model,
-                installGpuDrivers: true
+                provisioningModel: $provisioning_model
               }
             }
           ]
         }
         + $location_policy
+        + $network_policy
       ),
     logsPolicy: {
       destination: "CLOUD_LOGGING"
@@ -469,6 +565,11 @@ echo "Machine type: ${MACHINE_TYPE}"
 echo "Provisioning model: ${PROVISIONING_MODEL}"
 echo "Task count: ${TASK_COUNT}"
 echo "Parallelism: ${PARALLELISM}"
+if [[ -n "${NETWORK_NAME}" && -n "${SUBNETWORK_NAME}" ]]; then
+  echo "Network: ${NETWORK_NAME} (subnet: ${SUBNETWORK_NAME})"
+else
+  echo "Network: default (implicit)"
+fi
 echo "Bucket mount: gs://${BUCKET_PATH} -> /mnt/disks/rws"
 echo "Image: ${IMAGE_URI}"
 

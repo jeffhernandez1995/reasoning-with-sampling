@@ -13,11 +13,9 @@
 set -euo pipefail
 
 # --- map array id -> (batch_idx, seed) ---
-NUM_SHARDS=1
-NUM_SEEDS=1
 
-# NUM_SHARDS=5
-# NUM_SEEDS=8
+NUM_SHARDS=5
+NUM_SEEDS=8
 TOTAL_TASKS=$((NUM_SHARDS * NUM_SEEDS))
 if [[ "${SLURM_ARRAY_TASK_ID}" -ge "${TOTAL_TASKS}" ]]; then
   echo "SLURM_ARRAY_TASK_ID=${SLURM_ARRAY_TASK_ID} out of range for ${TOTAL_TASKS} tasks" >&2
@@ -60,10 +58,10 @@ mkdir -p "/scratch/$USER/logs" "${HF_HOME}"
 MODEL="${MODEL:-qwen_math}"
 TEMP="${TEMP:-0.25}"
 TOP_K="${TOP_K:-8}"
-CANDIDATE_POOL_SIZE="${CANDIDATE_POOL_SIZE:-32}"
-ROLLOUTS_PER_CANDIDATE="${ROLLOUTS_PER_CANDIDATE:-8}"
-LOOKAHEAD_TOKENS="${LOOKAHEAD_TOKENS:-192}"
-BLOCK_SIZE="${BLOCK_SIZE:-192}"
+CANDIDATE_POOL_SIZE="${CANDIDATE_POOL_SIZE:-8}"
+ROLLOUTS_PER_CANDIDATE="${ROLLOUTS_PER_CANDIDATE:-4}"
+LOOKAHEAD_TOKENS="${LOOKAHEAD_TOKENS:-32}"
+BLOCK_SIZE="${BLOCK_SIZE:-32}"
 USE_JACKKNIFE="${USE_JACKKNIFE:-true}"
 SAVE_STR="${SAVE_STR:-/scratch/$USER/reasoning-with-sampling/results}"
 MAX_QUESTIONS="${MAX_QUESTIONS:-}"
@@ -104,7 +102,6 @@ RUN_CMD="python \"${REPO_ROOT}/power_samp_math_approx.py\" \
   --candidate_pool_size \"${CANDIDATE_POOL_SIZE}\" \
   --rollouts_per_candidate \"${ROLLOUTS_PER_CANDIDATE}\" \
   --block_size \"${BLOCK_SIZE}\" \
-  --max_questions 3 \
   --use_jackknife \"${USE_JACKKNIFE}\" \
   ${EXTRA_ARGS}"
 
