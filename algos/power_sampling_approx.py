@@ -11,11 +11,14 @@ This module is backend-agnostic via `PowerApproxScorer`.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Protocol, Tuple
 
 import numpy as np
 import torch
+
+DEFAULT_APPROX_LOOKAHEAD_TOKENS = 192
 
 
 @dataclass
@@ -28,10 +31,10 @@ class PowerSamplerApproxConfig:
     candidate_pool_size: int = 32
     # Rollouts per candidate (M_t).
     rollouts_per_candidate: int = 8
-    # Truncated rollout horizon H_t. None means "use all remaining tokens".
-    lookahead_tokens: Optional[int] = None
+    # Truncated rollout horizon H_t. None falls back to DEFAULT_APPROX_LOOKAHEAD_TOKENS.
+    lookahead_tokens: Optional[int] = DEFAULT_APPROX_LOOKAHEAD_TOKENS
     # 1 => token-level Algorithm 1. >1 => Appendix-B block variant.
-    block_size: int = 1
+    block_size: int = DEFAULT_APPROX_LOOKAHEAD_TOKENS
     # Use Eq. 5 jackknife correction when M_t > 1.
     use_jackknife: bool = True
 
@@ -116,7 +119,7 @@ def _compute_power_probs(
     log_w = torch.where(torch.isfinite(log_w), log_w, torch.full_like(log_w, -1e9))
 
     # log z_hat(i) = logmeanexp(log_w_i)
-    log_z = torch.logsumexp(log_w, dim=1) - torch.log(torch.tensor(float(m), device=log_w.device))
+    log_z = torch.logsumexp(log_w, dim=1) - math.log(float(m))
     log_num = alpha * logp_items + log_z
     p_hat = _softmax_from_logits(log_num)
 
@@ -152,6 +155,15 @@ def _sample_index(probs: torch.Tensor, rng: np.random.Generator) -> int:
     else:
         p_np /= total
     return int(rng.choice(len(p_np), p=p_np))
+
+
+def _resolve_lookahead(cfg: PowerSamplerApproxConfig, remaining: int) -> int:
+    """Bound rollout horizon to avoid pathological full-horizon rollouts."""
+    cap = cfg.lookahead_tokens
+    if cap is None:
+        cap = DEFAULT_APPROX_LOOKAHEAD_TOKENS
+    cap_int = max(0, int(cap))
+    return min(max(0, int(remaining)), cap_int)
 
 
 def approx_power_sample(
@@ -203,9 +215,7 @@ def approx_power_sample(
                 break
 
             logp_items = torch.tensor(cand_logps, dtype=torch.float32)
-            lookahead = max(0, remaining - 1)
-            if cfg.lookahead_tokens is not None:
-                lookahead = min(lookahead, int(cfg.lookahead_tokens))
+            lookahead = _resolve_lookahead(cfg, remaining - 1)
             m = max(0, int(cfg.rollouts_per_candidate))
 
             if lookahead <= 0 or m <= 0:
@@ -226,8 +236,9 @@ def approx_power_sample(
                             top_k=None,
                             eos_token_id=eos_id,
                         )
+                        logp_sums_t = torch.as_tensor(logp_sums, dtype=torch.float32)
                         for local_idx, i in enumerate(non_terminal):
-                            rollout_logp[i, :] = torch.tensor(logp_sums[local_idx], dtype=torch.float32)
+                            rollout_logp[i, :] = logp_sums_t[local_idx]
                         total_rollouts += len(non_terminal) * m
                         total_rollout_tokens += int(sum(len(tokens) for per_prefix in conts for tokens in per_prefix))
 
@@ -314,9 +325,7 @@ def approx_power_sample(
         top_blocks = [candidate_blocks[i] for i in order]
         top_logp = torch.tensor([float(candidate_logp[i]) for i in order], dtype=torch.float32)
 
-        lookahead = max(0, remaining - block_len)
-        if cfg.lookahead_tokens is not None:
-            lookahead = min(lookahead, int(cfg.lookahead_tokens))
+        lookahead = _resolve_lookahead(cfg, remaining - block_len)
         m = max(0, int(cfg.rollouts_per_candidate))
 
         if lookahead <= 0 or m <= 0:
@@ -339,8 +348,9 @@ def approx_power_sample(
                         top_k=None,
                         eos_token_id=eos_id,
                     )
+                    logp_sums2_t = torch.as_tensor(logp_sums2, dtype=torch.float32)
                     for local_idx, i in enumerate(non_terminal):
-                        rollout_logp[i, :] = torch.tensor(logp_sums2[local_idx], dtype=torch.float32)
+                        rollout_logp[i, :] = logp_sums2_t[local_idx]
                     total_rollouts += len(non_terminal) * m
                     total_rollout_tokens += int(sum(len(tokens) for per_prefix in conts2 for tokens in per_prefix))
 

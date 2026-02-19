@@ -60,16 +60,18 @@ class _ApproxPowerHFScorer:
             return None
         return int(self._max_seq_len)
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def topk_next_tokens(self, prefix: List[int], k: int):
         if not prefix:
             raise ValueError("Prefix must contain at least one token.")
 
         input_ids = torch.tensor([prefix], dtype=torch.long, device=self.device)
+        attention_mask = torch.ones_like(input_ids)
         if self.max_seq_len is not None and input_ids.shape[1] > self.max_seq_len:
             input_ids = input_ids[:, -self.max_seq_len :]
+            attention_mask = attention_mask[:, -self.max_seq_len :]
 
-        logits = self.model(input_ids).logits[0, -1, :]
+        logits = self.model(input_ids=input_ids, attention_mask=attention_mask).logits[0, -1, :]
         log_probs = F.log_softmax(logits, dim=-1)
         k = max(1, min(int(k), int(log_probs.shape[0])))
         top_values, top_indices = torch.topk(log_probs, k=k, dim=-1)
@@ -78,7 +80,7 @@ class _ApproxPowerHFScorer:
             top_values.detach().cpu().tolist(),
         )
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def sample_continuations(
         self,
         prefixes: List[List[int]],
@@ -101,71 +103,130 @@ class _ApproxPowerHFScorer:
             return [[[] for _ in range(n)] for _ in prefixes], [[0.0 for _ in range(n)] for _ in prefixes]
 
         eos_id = eos_token_id if eos_token_id is not None else self.tokenizer.eos_token_id
-        generation_top_k = 0 if top_k is None else int(top_k)
+        eos_id_int = None if eos_id is None else int(eos_id)
+        top_k_val = None if top_k is None else int(top_k)
+        top_p_val = float(top_p)
+        temperature_val = float(temperature)
+        if temperature_val <= 0:
+            raise ValueError("temperature must be > 0.")
 
         continuation_rows: List[List[List[int]]] = [[[] for _ in range(n)] for _ in prefixes]
         logp_rows: List[List[float]] = [[0.0 for _ in range(n)] for _ in prefixes]
 
-        # Group by prefix length so sequence slicing after generation is unambiguous.
+        clipped_prefixes: List[List[int]] = prefixes
+        if self.max_seq_len is not None:
+            max_len = int(self.max_seq_len)
+            clipped_prefixes = [prefix[-max_len:] if len(prefix) > max_len else prefix for prefix in prefixes]
+
+        def _apply_top_k(logits: torch.Tensor) -> torch.Tensor:
+            if top_k_val is None or top_k_val <= 0:
+                return logits
+            k = min(int(top_k_val), int(logits.shape[-1]))
+            if k >= int(logits.shape[-1]):
+                return logits
+            top_values, _ = torch.topk(logits, k=k, dim=-1)
+            kth = top_values[:, -1].unsqueeze(-1)
+            return torch.where(logits < kth, torch.full_like(logits, -float("inf")), logits)
+
+        def _apply_top_p(logits: torch.Tensor) -> torch.Tensor:
+            if top_p_val >= 1.0:
+                return logits
+            if top_p_val <= 0.0:
+                argmax_ids = torch.argmax(logits, dim=-1, keepdim=True)
+                return torch.full_like(logits, -float("inf")).scatter(1, argmax_ids, logits.gather(1, argmax_ids))
+            sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+            sorted_probs = F.softmax(sorted_logits, dim=-1)
+            cumulative = torch.cumsum(sorted_probs, dim=-1)
+            sorted_mask = cumulative > top_p_val
+            sorted_mask[:, 0] = False
+            sorted_logits = sorted_logits.masked_fill(sorted_mask, -float("inf"))
+            return logits.scatter(1, sorted_indices, sorted_logits)
+
+        # Group by prefix length so prefill batching is unambiguous.
         groups: Dict[int, List[int]] = {}
-        for i, prefix in enumerate(prefixes):
+        for i, prefix in enumerate(clipped_prefixes):
             groups.setdefault(len(prefix), []).append(i)
 
-        for prefix_len, group_indices in groups.items():
+        pad_token = torch.tensor(self._pad_token_id, device=self.device, dtype=torch.long)
+
+        for _, group_indices in groups.items():
             flat_prefixes = []
             flat_meta = []
             for idx in group_indices:
                 for sample_idx in range(n):
-                    flat_prefixes.append(prefixes[idx])
+                    flat_prefixes.append(clipped_prefixes[idx])
                     flat_meta.append((idx, sample_idx))
 
             batch_input_ids = torch.tensor(flat_prefixes, dtype=torch.long, device=self.device)
-            output = self.model.generate(
-                batch_input_ids,
-                max_new_tokens=max_new_tokens,
-                do_sample=True,
-                temperature=float(temperature),
-                top_p=float(top_p),
-                top_k=generation_top_k,
-                eos_token_id=eos_id,
-                pad_token_id=self._pad_token_id,
-                return_dict_in_generate=True,
-                output_scores=True,
+            batch_size, prefix_len = batch_input_ids.shape
+            full_attention_mask = torch.ones(
+                (batch_size, prefix_len + max_new_tokens),
+                dtype=batch_input_ids.dtype,
+                device=self.device,
             )
+            outputs = self.model(
+                input_ids=batch_input_ids,
+                attention_mask=full_attention_mask[:, :prefix_len],
+                use_cache=True,
+            )
+            next_logits = outputs.logits[:, -1, :].float()
+            past_key_values = outputs.past_key_values
 
-            generated = output.sequences[:, prefix_len:]  # (batch, generated_steps)
-            steps = len(output.scores)
-            gathered_logps: Optional[torch.Tensor]
-            if steps > 0:
-                per_step_logps = []
-                for step_idx in range(steps):
-                    step_scores = output.scores[step_idx].float()
-                    step_token_ids = generated[:, step_idx]
-                    step_log_probs = F.log_softmax(step_scores, dim=-1)
-                    step_logp = step_log_probs.gather(1, step_token_ids.unsqueeze(1)).squeeze(1)
-                    per_step_logps.append(step_logp)
-                gathered_logps = torch.stack(per_step_logps, dim=1)
-                gathered_logps_list = gathered_logps.detach().cpu().tolist()
-            else:
-                gathered_logps_list = [[] for _ in range(generated.shape[0])]
+            generated = torch.full(
+                (batch_size, max_new_tokens),
+                self._pad_token_id,
+                dtype=torch.long,
+                device=self.device,
+            )
+            logp_sums = torch.zeros((batch_size,), dtype=torch.float32, device=self.device)
+            finished = torch.zeros((batch_size,), dtype=torch.bool, device=self.device)
+            generated_steps = 0
+            current_len = int(prefix_len)
 
-            generated_list = generated.detach().cpu().tolist()
+            for step_idx in range(max_new_tokens):
+                step_logits = next_logits
+                if temperature_val != 1.0:
+                    step_logits = step_logits / temperature_val
+                step_logits = _apply_top_k(step_logits)
+                step_logits = _apply_top_p(step_logits)
 
-            for row_idx, (orig_idx, sample_idx) in enumerate(flat_meta):
-                row_tokens = generated_list[row_idx]
-                row_logps = gathered_logps_list[row_idx]
+                step_log_probs = F.log_softmax(step_logits, dim=-1)
+                sampled_ids = torch.multinomial(torch.exp(step_log_probs), num_samples=1).squeeze(1)
+                sampled_logp = step_log_probs.gather(1, sampled_ids.unsqueeze(1)).squeeze(1)
 
-                out_tokens: List[int] = []
-                out_logp_sum = 0.0
-                for tok, tok_logp in zip(row_tokens, row_logps):
-                    tok = int(tok)
-                    out_tokens.append(tok)
-                    out_logp_sum += float(tok_logp)
-                    if eos_id is not None and tok == int(eos_id):
+                sampled_ids = torch.where(finished, pad_token, sampled_ids)
+                sampled_logp = torch.where(finished, torch.zeros_like(sampled_logp), sampled_logp)
+
+                generated[:, step_idx] = sampled_ids
+                logp_sums += sampled_logp
+                generated_steps = step_idx + 1
+
+                if eos_id_int is not None:
+                    finished = finished | sampled_ids.eq(eos_id_int)
+                    if bool(torch.all(finished).item()):
                         break
 
-                continuation_rows[orig_idx][sample_idx] = out_tokens
-                logp_rows[orig_idx][sample_idx] = out_logp_sum
+                current_len += 1
+                outputs = self.model(
+                    input_ids=sampled_ids.unsqueeze(1),
+                    attention_mask=full_attention_mask[:, :current_len],
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                )
+                next_logits = outputs.logits[:, -1, :].float()
+                past_key_values = outputs.past_key_values
+
+            generated_rows = generated[:, :generated_steps].detach().cpu().tolist()
+            logp_values = logp_sums.detach().cpu().tolist()
+            for row_idx, (orig_idx, sample_idx) in enumerate(flat_meta):
+                row_tokens: List[int] = []
+                for tok in generated_rows[row_idx]:
+                    tok_int = int(tok)
+                    row_tokens.append(tok_int)
+                    if eos_id_int is not None and tok_int == eos_id_int:
+                        break
+                continuation_rows[orig_idx][sample_idx] = row_tokens
+                logp_rows[orig_idx][sample_idx] = float(logp_values[row_idx])
 
         return continuation_rows, logp_rows
 
@@ -179,6 +240,11 @@ class GenericSampler:
         self.device = device
         self.autoreg_sampler = AutoregressiveSampler(model, tokenizer, device)
         self.approx_power_scorer = _ApproxPowerHFScorer(model, tokenizer, device)
+        self._pad_token_id = tokenizer.pad_token_id
+        if self._pad_token_id is None:
+            self._pad_token_id = tokenizer.eos_token_id
+        if self._pad_token_id is None:
+            self._pad_token_id = 0
         self._method_registry = {
             "power": self._sample_power,
             "power_approx": self._sample_power_approx,
@@ -188,18 +254,22 @@ class GenericSampler:
     def available_methods(self) -> List[str]:
         return sorted(self._method_registry.keys())
 
+    @torch.inference_mode()
     def sample_standard(self, input_ids, max_new_tokens: int = 3072) -> SamplingOutput:
         prompt_len = input_ids.shape[1]
+        attention_mask = torch.ones_like(input_ids)
         start = perf_counter()
         output = self.model.generate(
             input_ids,
+            attention_mask=attention_mask,
             max_new_tokens=max_new_tokens,
-            return_dict_in_generate=True,
-            output_scores=True,
+            return_dict_in_generate=False,
+            output_scores=False,
             do_sample=True,
+            pad_token_id=self._pad_token_id,
         )
         latency_seconds = perf_counter() - start
-        generated_ids = output.sequences[0][prompt_len:].detach().cpu().tolist()
+        generated_ids = output[0][prompt_len:].detach().cpu().tolist()
         completion = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
         return SamplingOutput(
             method="standard",
@@ -208,19 +278,23 @@ class GenericSampler:
             latency_seconds=latency_seconds,
         )
 
+    @torch.inference_mode()
     def sample_temperature(self, input_ids, temperature: float, max_new_tokens: int = 3072) -> SamplingOutput:
         prompt_len = input_ids.shape[1]
+        attention_mask = torch.ones_like(input_ids)
         start = perf_counter()
         output = self.model.generate(
             input_ids,
+            attention_mask=attention_mask,
             max_new_tokens=max_new_tokens,
-            return_dict_in_generate=True,
-            output_scores=True,
+            return_dict_in_generate=False,
+            output_scores=False,
             do_sample=True,
             temperature=temperature,
+            pad_token_id=self._pad_token_id,
         )
         latency_seconds = perf_counter() - start
-        generated_ids = output.sequences[0][prompt_len:].detach().cpu().tolist()
+        generated_ids = output[0][prompt_len:].detach().cpu().tolist()
         completion = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
         return SamplingOutput(
             method="temperature",
@@ -322,8 +396,8 @@ class GenericSampler:
             top_k=_as_int("top_k", 8),
             candidate_pool_size=_as_int("candidate_pool_size", 32),
             rollouts_per_candidate=_as_int("rollouts_per_candidate", 8),
-            lookahead_tokens=_as_opt_int("lookahead_tokens", None),
-            block_size=_as_int("block_size", 1),
+            lookahead_tokens=_as_opt_int("lookahead_tokens", 192),
+            block_size=_as_int("block_size", 192),
             use_jackknife=_as_bool("use_jackknife", True),
         )
 
@@ -381,18 +455,24 @@ def load_model_and_tokenizer(
     local_files_only: bool = False,
 ):
     model_name = resolve_model_name(model_alias)
+    use_auto_device_map = str(device).startswith("cuda")
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         model_name,
         trust_remote_code=trust_remote_code,
         local_files_only=local_files_only,
     )
-    model = transformers.AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype="auto",
-        device_map="auto",
-        trust_remote_code=trust_remote_code,
-        local_files_only=local_files_only,
-    ).to(device)
+    model_kwargs: Dict[str, Any] = {
+        "torch_dtype": "auto",
+        "low_cpu_mem_usage": True,
+        "trust_remote_code": trust_remote_code,
+        "local_files_only": local_files_only,
+    }
+    if use_auto_device_map:
+        model_kwargs["device_map"] = "auto"
+    model = transformers.AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
+    if not use_auto_device_map:
+        model = model.to(device)
+    model.eval()
     return model, tokenizer
 
 
