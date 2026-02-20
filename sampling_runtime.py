@@ -13,6 +13,7 @@ import transformers
 
 from algos.power_sampling_approx import PowerSamplerApproxConfig, approx_power_sample
 from algos.power_sampling_mcmc import AutoregressiveSampler, mcmc_power_samp
+from algos.power_sampling_smc import PowerSamplerSMCConfig, smc_power_sample
 
 
 MODEL_NAME_BY_ALIAS = {
@@ -248,6 +249,7 @@ class GenericSampler:
         self._method_registry = {
             "power": self._sample_power,
             "power_approx": self._sample_power_approx,
+            "power_smc": self._sample_power_smc,
         }
 
     @property
@@ -432,6 +434,93 @@ class GenericSampler:
 
         return SamplingOutput(
             method="power_approx",
+            completion=completion,
+            token_ids=generated_token_ids,
+            latency_seconds=latency_seconds,
+            metadata=metadata,
+            full_completion=full_completion,
+            full_token_ids=sampled_token_ids,
+        )
+
+    def _sample_power_smc(
+        self,
+        input_ids,
+        temperature: float,
+        mcmc_steps: int,
+        max_new_tokens: int,
+        method_config: Optional[Dict[str, Any]] = None,
+    ) -> SamplingOutput:
+        """SMC/Feynman--Kac particle filter sampler for the power distribution."""
+
+        del mcmc_steps  # Unused for SMC.
+        method_config = method_config or {}
+
+        def _as_int(name: str, default: int) -> int:
+            value = method_config.get(name, default)
+            return int(value)
+
+        def _as_opt_int(name: str, default: Optional[int]) -> Optional[int]:
+            value = method_config.get(name, default)
+            if value is None:
+                return None
+            return int(value)
+
+        def _as_float(name: str, default: float) -> float:
+            value = method_config.get(name, default)
+            return float(value)
+
+        def _as_bool(name: str, default: bool) -> bool:
+            value = method_config.get(name, default)
+            if isinstance(value, bool):
+                return value
+            return str(value).strip().lower() in {"1", "true", "t", "yes", "y"}
+
+        cfg = PowerSamplerSMCConfig(
+            temp=float(temperature),
+            num_particles=_as_int("num_particles", 8),
+            ess_threshold=_as_float("ess_threshold", 0.5),
+            resample_interval=_as_int("resample_interval", 8),
+            resample_method=str(method_config.get("resample_method", "systematic")),
+            proposal_temperature=_as_float("proposal_temperature", 1.0),
+            proposal_top_k=_as_opt_int("proposal_top_k", None),
+            proposal_top_p=_as_float("proposal_top_p", 1.0),
+            max_logw_step=_as_float("max_logw_step", 50.0),
+            stop_on_all_eos=_as_bool("stop_on_all_eos", True),
+            seed=method_config.get("seed"),
+        )
+
+        prompt_token_ids = input_ids[0].detach().cpu().tolist()
+        eos_id = method_config.get("eos_token_id", self.tokenizer.eos_token_id)
+        pad_id = method_config.get("pad_token_id", self._pad_token_id)
+
+        start = perf_counter()
+        sampled_token_ids, diag = smc_power_sample(
+            self.model,
+            self.tokenizer,
+            self.device,
+            prompt_token_ids,
+            cfg=cfg,
+            max_new_tokens=max_new_tokens,
+            eos_token_id=eos_id,
+            pad_token_id=pad_id,
+        )
+        latency_seconds = perf_counter() - start
+
+        generated_token_ids = sampled_token_ids
+        if sampled_token_ids[: len(prompt_token_ids)] == prompt_token_ids:
+            generated_token_ids = sampled_token_ids[len(prompt_token_ids) :]
+
+        completion = self.tokenizer.decode(generated_token_ids, skip_special_tokens=True)
+        full_completion = self.tokenizer.decode(sampled_token_ids, skip_special_tokens=True)
+
+        metadata: Dict[str, Any] = {
+            "temperature": float(temperature),
+            "smc_config": asdict(cfg),
+        }
+        metadata.update(diag)
+
+        return SamplingOutput(
+            method="power_smc",
             completion=completion,
             token_ids=generated_token_ids,
             latency_seconds=latency_seconds,
