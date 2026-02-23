@@ -38,8 +38,8 @@ export HF_DATASETS_TRUST_REMOTE_CODE=True
 # --- Runtime tuning ---
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-26}"
 export TOKENIZERS_PARALLELISM=false
-export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
-export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-max_split_size_mb:256}"
+export NCCL_DEBUG="WARN"
+export PYTORCH_CUDA_ALLOC_CONF="max_split_size_mb:256"
 
 # --- Paths / run params ---
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -51,10 +51,11 @@ fi
 cd "${REPO_ROOT}"
 mkdir -p "/scratch/$USER/logs" "${HF_HOME}"
 
-MODEL="${MODEL:-qwen_math}"
-MCMC_STEPS="${MCMC_STEPS:-10}"
-TEMP="${TEMP:-0.25}"
-SAVE_STR="${SAVE_STR:-/scratch/$USER/reasoning-with-sampling/results}"
+# Force run config in-script to avoid inheriting submit-shell overrides.
+MODEL="qwen_math"
+MCMC_STEPS="10"
+TEMP="0.25"
+SAVE_STR="/scratch/$USER/reasoning-with-sampling/results"
 mkdir -p "${SAVE_STR}"
 
 echo "== Node =="

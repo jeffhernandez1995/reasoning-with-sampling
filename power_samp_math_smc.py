@@ -103,7 +103,12 @@ if __name__ == "__main__":
     parser.add_argument("--temperature", "--temp", dest="temperature", type=float, default=0.25)
     parser.add_argument("--dataset", type=str, default="MATH")
     parser.add_argument("--cot", type=parse_bool, default=True)
-    parser.add_argument("--sampling_method", type=str, default="power_smc", choices=["power_smc"])
+    parser.add_argument(
+        "--sampling_method",
+        type=str,
+        default="power_smc",
+        choices=["power_smc", "power_smc_apf"],
+    )
     parser.add_argument("--max_new_tokens", type=int, default=3072)
     parser.add_argument("--num_particles", type=int, default=8)
     parser.add_argument("--ess_threshold", type=float, default=0.5)
@@ -117,6 +122,9 @@ if __name__ == "__main__":
     parser.add_argument("--proposal_temperature", type=float, default=1.0)
     parser.add_argument("--proposal_top_k", type=int, default=None)
     parser.add_argument("--proposal_top_p", type=float, default=1.0)
+    parser.add_argument("--use_auxiliary", type=parse_bool, default=False)
+    parser.add_argument("--auxiliary_resample_always", type=parse_bool, default=False)
+    parser.add_argument("--auxiliary_temperature", type=float, default=None)
     parser.add_argument("--max_logw_step", type=float, default=50.0)
     parser.add_argument("--stop_on_all_eos", type=parse_bool, default=True)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -155,6 +163,9 @@ if __name__ == "__main__":
         "proposal_temperature": args.proposal_temperature,
         "proposal_top_k": args.proposal_top_k,
         "proposal_top_p": args.proposal_top_p,
+        "use_auxiliary": args.use_auxiliary,
+        "auxiliary_resample_always": args.auxiliary_resample_always,
+        "auxiliary_temperature": args.auxiliary_temperature,
         "max_logw_step": args.max_logw_step,
         "stop_on_all_eos": args.stop_on_all_eos,
         "seed": args.seed,
@@ -195,7 +206,7 @@ if __name__ == "__main__":
     output_path = os.path.join(
         save_str,
         (
-            f"{args.model}_math_base_power_smc_results_"
+            f"{args.model}_math_base_{args.sampling_method}_results_"
             f"n{args.num_particles}_ess{args.ess_threshold}_ri{args.resample_interval}_"
             f"t{args.temperature}_{args.batch_idx}_{args.seed}.csv"
         ),

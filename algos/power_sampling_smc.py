@@ -1,11 +1,14 @@
 """Sequential Monte Carlo (SMC) / Feynman--Kac power sampling.
 
-This module implements a particle-filter style sampler for the tempered
-("power") distribution over continuations:
+This module implements a particle-filter style sampler for the "power"
+(tempered / sharpened) distribution over continuations:
 
   pi(x_{1:T} | c) propto p(x_{1:T} | c)^alpha,
 
 where p is the base autoregressive model distribution and alpha = 1 / temp.
+
+It also supports an auxiliary particle filter (APF) variant with lookahead
+resampling based on the one-step partition function.
 """
 
 from __future__ import annotations
@@ -51,6 +54,19 @@ class PowerSamplerSMCConfig:
 
     # Optional RNG seed for sampling and resampling.
     seed: Optional[int] = None
+
+    # --- Auxiliary particle filter / lookahead resampling ---
+    # If True, perform lookahead pre-resampling using m_t computed from
+    # current next-token logits before sampling x_t.
+    use_auxiliary: bool = False
+
+    # If True, resample at every APF opportunity (every resample_interval
+    # steps) regardless of ESS. Otherwise use ESS(w_{t-1} * m_t).
+    auxiliary_resample_always: bool = False
+
+    # Temperature used for auxiliary lookahead mass m_t. If None, defaults to
+    # cfg.temp (i.e., alpha_aux == alpha).
+    auxiliary_temperature: Optional[float] = None
 
 
 def _apply_top_k(logits: torch.Tensor, top_k: Optional[int]) -> torch.Tensor:
@@ -299,12 +315,47 @@ def smc_power_sample(
     resample_interval = max(1, int(cfg.resample_interval))
     ess_threshold = float(cfg.ess_threshold)
     max_logw_step = float(cfg.max_logw_step)
+    alpha_aux = alpha
+    if cfg.auxiliary_temperature is not None:
+        aux_temp = float(cfg.auxiliary_temperature)
+        if aux_temp <= 0:
+            raise ValueError("cfg.auxiliary_temperature must be > 0")
+        alpha_aux = 1.0 / aux_temp
 
     eos_tensor: Optional[torch.Tensor] = None
     if eos_id_int is not None:
         eos_tensor = torch.tensor(eos_id_int, device=batch_input_ids.device, dtype=torch.long)
 
     for step_idx in range(max_new_tokens):
+        log_m_selected: Optional[torch.Tensor] = None
+        if bool(cfg.use_auxiliary) and num_particles > 1 and (step_idx % resample_interval == 0):
+            # log m_t = logsumexp(alpha_aux * logits) - alpha_aux * logsumexp(logits).
+            log_z = torch.logsumexp(next_logits, dim=-1)
+            log_z_aux = torch.logsumexp(next_logits * float(alpha_aux), dim=-1)
+            log_m = log_z_aux - float(alpha_aux) * log_z
+            log_m = torch.where(torch.isfinite(log_m), log_m, torch.zeros_like(log_m))
+            # Finished particles are absorbing; keep auxiliary factor neutral.
+            log_m = torch.where(finished, torch.zeros_like(log_m), log_m)
+
+            aux_weights = _normalized_weights(logw + log_m)
+            ess_val = _ess(aux_weights)
+            ess_sum += ess_val
+            ess_count += 1
+
+            should_resample = bool(cfg.auxiliary_resample_always)
+            if not should_resample and ess_threshold > 0.0:
+                should_resample = (ess_val / float(num_particles)) < ess_threshold
+
+            if should_resample:
+                indices = _resample_indices(aux_weights, method=cfg.resample_method, generator=generator)
+                generated = generated.index_select(0, indices)
+                finished = finished.index_select(0, indices)
+                past_key_values = _reorder_past_key_values(model, past_key_values, indices)
+                next_logits = next_logits.index_select(0, indices)
+                log_m_selected = log_m.index_select(0, indices)
+                logw = torch.zeros_like(logw)
+                num_resamples += 1
+
         already_finished = finished
 
         # Base model probabilities p(x_t | x_<t).
@@ -330,6 +381,9 @@ def smc_power_sample(
         log_p_tok = log_p.gather(1, sampled_ids.unsqueeze(1)).squeeze(1)
         log_q_tok = log_q.gather(1, sampled_ids.unsqueeze(1)).squeeze(1)
         increment = alpha * log_p_tok - log_q_tok
+        if log_m_selected is not None:
+            # APF correction: divide by the auxiliary ancestor factor m_t.
+            increment = increment - log_m_selected
         increment = torch.where(already_finished, torch.zeros_like(increment), increment)
         if max_logw_step > 0:
             increment = torch.clamp(increment, min=-max_logw_step, max=max_logw_step)
@@ -342,25 +396,27 @@ def smc_power_sample(
 
         steps_done = step_idx + 1
 
-        should_resample = False
-        normalized = None
+        # Standard post-propagation resampling is used only without APF.
+        if not bool(cfg.use_auxiliary):
+            should_resample = False
+            normalized = None
 
-        if num_particles > 1 and ((step_idx + 1) % resample_interval == 0):
-            normalized = _normalized_weights(logw)
-            ess_val = _ess(normalized)
-            ess_sum += ess_val
-            ess_count += 1
-            if ess_threshold > 0.0 and (ess_val / float(num_particles)) < ess_threshold:
-                should_resample = True
+            if num_particles > 1 and ((step_idx + 1) % resample_interval == 0):
+                normalized = _normalized_weights(logw)
+                ess_val = _ess(normalized)
+                ess_sum += ess_val
+                ess_count += 1
+                if ess_threshold > 0.0 and (ess_val / float(num_particles)) < ess_threshold:
+                    should_resample = True
 
-        if should_resample and normalized is not None:
-            indices = _resample_indices(normalized, method=cfg.resample_method, generator=generator)
-            generated = generated.index_select(0, indices)
-            finished = finished.index_select(0, indices)
-            past_key_values = _reorder_past_key_values(model, past_key_values, indices)
-            sampled_ids = generated[:, step_idx]
-            logw = torch.zeros_like(logw)
-            num_resamples += 1
+            if should_resample and normalized is not None:
+                indices = _resample_indices(normalized, method=cfg.resample_method, generator=generator)
+                generated = generated.index_select(0, indices)
+                finished = finished.index_select(0, indices)
+                past_key_values = _reorder_past_key_values(model, past_key_values, indices)
+                sampled_ids = generated[:, step_idx]
+                logw = torch.zeros_like(logw)
+                num_resamples += 1
 
         if bool(cfg.stop_on_all_eos) and eos_id_int is not None and bool(torch.all(finished).item()):
             break
@@ -399,6 +455,12 @@ def smc_power_sample(
         "proposal_temperature": float(cfg.proposal_temperature),
         "proposal_top_k": None if cfg.proposal_top_k is None else float(int(cfg.proposal_top_k)),
         "proposal_top_p": float(cfg.proposal_top_p),
+        "use_auxiliary": bool(cfg.use_auxiliary),
+        "auxiliary_resample_always": bool(cfg.auxiliary_resample_always),
+        "auxiliary_temperature": None
+        if cfg.auxiliary_temperature is None
+        else float(cfg.auxiliary_temperature),
+        "auxiliary_alpha": float(alpha_aux),
         "temperature": float(cfg.temp),
         "alpha": float(alpha),
     }

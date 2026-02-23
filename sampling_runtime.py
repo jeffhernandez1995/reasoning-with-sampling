@@ -250,6 +250,7 @@ class GenericSampler:
             "power": self._sample_power,
             "power_approx": self._sample_power_approx,
             "power_smc": self._sample_power_smc,
+            "power_smc_apf": self._sample_power_smc,
         }
 
     @property
@@ -469,6 +470,12 @@ class GenericSampler:
             value = method_config.get(name, default)
             return float(value)
 
+        def _as_opt_float(name: str, default: Optional[float]) -> Optional[float]:
+            value = method_config.get(name, default)
+            if value is None:
+                return None
+            return float(value)
+
         def _as_bool(name: str, default: bool) -> bool:
             value = method_config.get(name, default)
             if isinstance(value, bool):
@@ -486,6 +493,9 @@ class GenericSampler:
             proposal_top_p=_as_float("proposal_top_p", 1.0),
             max_logw_step=_as_float("max_logw_step", 50.0),
             stop_on_all_eos=_as_bool("stop_on_all_eos", True),
+            use_auxiliary=_as_bool("use_auxiliary", False),
+            auxiliary_resample_always=_as_bool("auxiliary_resample_always", False),
+            auxiliary_temperature=_as_opt_float("auxiliary_temperature", None),
             seed=method_config.get("seed"),
         )
 
