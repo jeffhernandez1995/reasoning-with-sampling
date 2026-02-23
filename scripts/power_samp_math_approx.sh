@@ -59,9 +59,13 @@ mkdir -p "/scratch/$USER/logs" "${HF_HOME}"
 MODEL="qwen_math"
 TEMP="0.25"
 TOP_K="8"
+# Keep this run lightweight; paper reports L=10.
 CANDIDATE_POOL_SIZE="8"
+# Keep this run lightweight; paper reports Mt=8.
 ROLLOUTS_PER_CANDIDATE="4"
+# Keep this run lightweight; paper reports H=192.
 LOOKAHEAD_TOKENS="32"
+# Keep this run lightweight; paper reports B=192.
 BLOCK_SIZE="32"
 USE_JACKKNIFE="true"
 SAVE_STR="/scratch/$USER/reasoning-with-sampling/results"

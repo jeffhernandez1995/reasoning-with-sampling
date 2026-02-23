@@ -85,10 +85,18 @@ def _softmax_from_logits(logits_1d: torch.Tensor) -> torch.Tensor:
     return probs
 
 
+def _mean_logp(logp_sums: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+    """Convert cumulative log-probabilities to per-token means."""
+    lengths = torch.clamp(lengths.to(dtype=logp_sums.dtype), min=1.0)
+    return logp_sums / lengths
+
+
 def _compute_power_probs(
     *,
     logp_items: torch.Tensor,  # (K,)
+    item_lengths: torch.Tensor,  # (K,)
     rollout_logp_sums: torch.Tensor,  # (K, M)
+    rollout_lengths: torch.Tensor,  # (K, M)
     alpha: float,
     use_jackknife: bool,
 ) -> torch.Tensor:
@@ -98,6 +106,9 @@ def _compute_power_probs(
       p_hat(i) ∝ p(i)^alpha * z_hat(i),
       z_hat(i) = (1/M) * sum_r exp((alpha - 1) * log p_rollout_{i,r}).
 
+    We use per-token mean log-probabilities for both candidate and rollout
+    weights to reduce variable-length bias.
+
     Jackknife (Eq. 5 + Eq. 6):
       p_jk(i) = M * p_hat(i) - ((M - 1) / M) * sum_s p_hat_{-s}(i).
     """
@@ -105,22 +116,30 @@ def _compute_power_probs(
     if k == 0:
         return torch.empty((0,), dtype=torch.float32, device=logp_items.device)
 
+    if int(item_lengths.numel()) != k:
+        item_lengths = torch.ones((k,), dtype=torch.float32, device=logp_items.device)
+    item_logp_mean = _mean_logp(logp_items, item_lengths)
+
     if alpha <= 0:
-        return _softmax_from_logits(logp_items)
+        return _softmax_from_logits(item_logp_mean)
 
     if rollout_logp_sums.numel() == 0:
-        return _softmax_from_logits(alpha * logp_items)
+        return _softmax_from_logits(alpha * item_logp_mean)
 
     m = int(rollout_logp_sums.shape[1])
     if m <= 0:
-        return _softmax_from_logits(alpha * logp_items)
+        return _softmax_from_logits(alpha * item_logp_mean)
 
-    log_w = (alpha - 1.0) * rollout_logp_sums
+    if tuple(rollout_lengths.shape) != tuple(rollout_logp_sums.shape):
+        rollout_lengths = torch.ones_like(rollout_logp_sums, dtype=torch.float32)
+    rollout_logp_mean = _mean_logp(rollout_logp_sums, rollout_lengths)
+
+    log_w = (alpha - 1.0) * rollout_logp_mean
     log_w = torch.where(torch.isfinite(log_w), log_w, torch.full_like(log_w, -1e9))
 
     # log z_hat(i) = logmeanexp(log_w_i)
     log_z = torch.logsumexp(log_w, dim=1) - math.log(float(m))
-    log_num = alpha * logp_items + log_z
+    log_num = alpha * item_logp_mean + log_z
     p_hat = _softmax_from_logits(log_num)
 
     if not use_jackknife or m <= 1:
@@ -133,7 +152,7 @@ def _compute_power_probs(
     sum_minus = torch.clamp(sum_scaled - w_scaled, min=1e-30)
     log_z_loo = m_i + torch.log(sum_minus / float(m - 1))
 
-    log_num_loo = alpha * logp_items.view(k, 1) + log_z_loo
+    log_num_loo = alpha * item_logp_mean.view(k, 1) + log_z_loo
     # For each leave-one-out sample s, normalize across candidates i.
     p_hat_loo = torch.softmax(log_num_loo.transpose(0, 1), dim=1)  # (M, K)
     sum_p_hat_loo = torch.sum(p_hat_loo, dim=0)  # (K,)
@@ -215,13 +234,15 @@ def approx_power_sample(
                 break
 
             logp_items = torch.tensor(cand_logps, dtype=torch.float32)
+            item_lengths = torch.ones((k,), dtype=torch.float32)
             lookahead = _resolve_lookahead(cfg, remaining - 1)
             m = max(0, int(cfg.rollouts_per_candidate))
 
             if lookahead <= 0 or m <= 0:
-                probs = _softmax_from_logits(alpha * logp_items)
+                probs = _softmax_from_logits(alpha * _mean_logp(logp_items, item_lengths))
             else:
                 rollout_logp = torch.zeros((k, m), dtype=torch.float32)
+                rollout_lengths = torch.ones((k, m), dtype=torch.float32)
                 non_terminal = [i for i, tok in enumerate(cand_tokens) if int(tok) != eos_id]
                 if non_terminal:
                     prefixes = [seq + [int(cand_tokens[i])] for i in non_terminal]
@@ -237,14 +258,21 @@ def approx_power_sample(
                             eos_token_id=eos_id,
                         )
                         logp_sums_t = torch.as_tensor(logp_sums, dtype=torch.float32)
+                        rollout_lengths_t = torch.as_tensor(
+                            [[float(max(len(tokens), 1)) for tokens in per_prefix] for per_prefix in conts],
+                            dtype=torch.float32,
+                        )
                         for local_idx, i in enumerate(non_terminal):
                             rollout_logp[i, :] = logp_sums_t[local_idx]
+                            rollout_lengths[i, :] = rollout_lengths_t[local_idx]
                         total_rollouts += len(non_terminal) * m
                         total_rollout_tokens += int(sum(len(tokens) for per_prefix in conts for tokens in per_prefix))
 
                 probs = _compute_power_probs(
                     logp_items=logp_items,
+                    item_lengths=item_lengths,
                     rollout_logp_sums=rollout_logp,
+                    rollout_lengths=rollout_lengths,
                     alpha=alpha,
                     use_jackknife=bool(cfg.use_jackknife),
                 )
@@ -280,7 +308,7 @@ def approx_power_sample(
                 [seq],
                 max_new_tokens=chunk_len,
                 n=l,
-                temperature=1.0,
+                temperature=float(cfg.temp),
                 top_p=1.0,
                 top_k=None,
                 eos_token_id=eos_id,
@@ -291,7 +319,8 @@ def approx_power_sample(
             order = np.argsort(candidate_logp)[::-1][:k]
             top_blocks = [candidate_blocks[i] for i in order]
             top_logp = torch.tensor([float(candidate_logp[i]) for i in order], dtype=torch.float32)
-            probs = _softmax_from_logits(alpha * top_logp)
+            top_lengths = torch.tensor([float(max(len(block), 1)) for block in top_blocks], dtype=torch.float32)
+            probs = _softmax_from_logits(alpha * _mean_logp(top_logp, top_lengths))
 
             chosen = top_blocks[_sample_index(probs, rng)]
             for tok in chosen:
@@ -313,7 +342,7 @@ def approx_power_sample(
             [seq],
             max_new_tokens=block_len,
             n=l,
-            temperature=1.0,
+            temperature=float(cfg.temp),
             top_p=1.0,
             top_k=None,
             eos_token_id=eos_id,
@@ -324,15 +353,17 @@ def approx_power_sample(
         order = np.argsort(candidate_logp)[::-1][:k]
         top_blocks = [candidate_blocks[i] for i in order]
         top_logp = torch.tensor([float(candidate_logp[i]) for i in order], dtype=torch.float32)
+        top_lengths = torch.tensor([float(max(len(block), 1)) for block in top_blocks], dtype=torch.float32)
 
         lookahead = _resolve_lookahead(cfg, remaining - block_len)
         m = max(0, int(cfg.rollouts_per_candidate))
 
         if lookahead <= 0 or m <= 0:
-            probs = _softmax_from_logits(alpha * top_logp)
+            probs = _softmax_from_logits(alpha * _mean_logp(top_logp, top_lengths))
         else:
             terminal = [eos_id in block for block in top_blocks]
             rollout_logp = torch.zeros((k, m), dtype=torch.float32)
+            rollout_lengths = torch.ones((k, m), dtype=torch.float32)
             non_terminal = [i for i, term in enumerate(terminal) if not term]
 
             if non_terminal:
@@ -349,14 +380,21 @@ def approx_power_sample(
                         eos_token_id=eos_id,
                     )
                     logp_sums2_t = torch.as_tensor(logp_sums2, dtype=torch.float32)
+                    rollout_lengths2_t = torch.as_tensor(
+                        [[float(max(len(tokens), 1)) for tokens in per_prefix] for per_prefix in conts2],
+                        dtype=torch.float32,
+                    )
                     for local_idx, i in enumerate(non_terminal):
                         rollout_logp[i, :] = logp_sums2_t[local_idx]
+                        rollout_lengths[i, :] = rollout_lengths2_t[local_idx]
                     total_rollouts += len(non_terminal) * m
                     total_rollout_tokens += int(sum(len(tokens) for per_prefix in conts2 for tokens in per_prefix))
 
             probs = _compute_power_probs(
                 logp_items=top_logp,
+                item_lengths=top_lengths,
                 rollout_logp_sums=rollout_logp,
+                rollout_lengths=rollout_lengths,
                 alpha=alpha,
                 use_jackknife=bool(cfg.use_jackknife),
             )
