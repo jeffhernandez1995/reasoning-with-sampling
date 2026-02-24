@@ -337,12 +337,13 @@ class GenericSampler:
     ) -> SamplingOutput:
         prompt_token_ids = input_ids[0].detach().cpu().tolist()
         start = perf_counter()
-        sampled_token_ids, _, _, acceptance_ratio = mcmc_power_samp(
+        sampled_token_ids, _, _, acceptance_ratio, diagnostics = mcmc_power_samp(
             self.autoreg_sampler,
             prompt_token_ids,
             temperature,
             mcmc_steps,
             max_new_tokens=max_new_tokens,
+            return_diagnostics=True,
         )
         latency_seconds = perf_counter() - start
 
@@ -362,6 +363,7 @@ class GenericSampler:
                 "acceptance_ratio": acceptance_ratio,
                 "temperature": temperature,
                 "mcmc_steps": mcmc_steps,
+                **diagnostics,
             },
             full_completion=full_completion,
             full_token_ids=sampled_token_ids,

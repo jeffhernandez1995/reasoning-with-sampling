@@ -126,7 +126,12 @@ if __name__ == "__main__":
         method_reward = safe_grade(method_sample.completion, answer)
 
         power_seconds = method_sample.latency_seconds
+        temp_output_tokens = len(naive_sample.token_ids)
+        std_output_tokens = len(std_sample.token_ids)
         acceptance_ratio = method_sample.metadata.get("acceptance_ratio")
+        sampling_tokens = method_sample.metadata.get("sampling_tokens")
+        output_tokens = method_sample.metadata.get("output_tokens")
+        internal_sampling_tokens = method_sample.metadata.get("internal_sampling_tokens")
         total_power_seconds += power_seconds
         total_power_samples += 1
         avg_power_seconds = total_power_seconds / max(total_power_samples, 1)
@@ -142,7 +147,14 @@ if __name__ == "__main__":
                 "sampling_method": args.sampling_method,
                 "power_sampling_seconds": power_seconds,
                 "power_sampling_avg_seconds_so_far": avg_power_seconds,
+                "temp_output_tokens": temp_output_tokens,
+                "temp_sampling_tokens": temp_output_tokens,
+                "std_output_tokens": std_output_tokens,
+                "std_sampling_tokens": std_output_tokens,
                 "power_acceptance_ratio": acceptance_ratio,
+                "power_sampling_tokens": sampling_tokens,
+                "power_output_tokens": output_tokens,
+                "power_internal_sampling_tokens": internal_sampling_tokens,
                 "naive_reward": naive_reward,
                 "std_reward": std_reward,
                 "mcmc_reward": method_reward,
@@ -156,7 +168,14 @@ if __name__ == "__main__":
                 "reward/naive": naive_reward,
                 "reward/std": std_reward,
                 "reward/mcmc": method_reward,
+                "sampling/temp_output_tokens": temp_output_tokens,
+                "sampling/temp_sampling_tokens": temp_output_tokens,
+                "sampling/std_output_tokens": std_output_tokens,
+                "sampling/std_sampling_tokens": std_output_tokens,
                 "sampling/acceptance_ratio": acceptance_ratio,
+                "sampling/power_sampling_tokens": sampling_tokens,
+                "sampling/power_output_tokens": output_tokens,
+                "sampling/power_internal_sampling_tokens": internal_sampling_tokens,
             },
             step=step_idx,
         )
@@ -172,7 +191,13 @@ if __name__ == "__main__":
                 "std_reward": std_reward,
                 "mcmc_reward": method_reward,
                 "power_sampling_seconds": power_seconds,
+                "temp_output_tokens": temp_output_tokens,
+                "temp_sampling_tokens": temp_output_tokens,
+                "std_output_tokens": std_output_tokens,
+                "std_sampling_tokens": std_output_tokens,
                 "power_acceptance_ratio": acceptance_ratio,
+                "power_sampling_tokens": sampling_tokens,
+                "power_output_tokens": output_tokens,
             }
         )
 

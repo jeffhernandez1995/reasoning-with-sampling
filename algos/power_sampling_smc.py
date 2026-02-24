@@ -246,7 +246,15 @@ def smc_power_sample(
     alpha = 1.0 / float(cfg.temp)
     max_new_tokens = max(0, int(max_new_tokens))
     if max_new_tokens == 0:
-        return context.copy(), {"steps": 0.0, "num_resamples": 0.0, "avg_ess": 0.0, "final_ess": 0.0}
+        return context.copy(), {
+            "steps": 0.0,
+            "num_resamples": 0.0,
+            "avg_ess": 0.0,
+            "final_ess": 0.0,
+            "output_tokens": 0.0,
+            "sampling_tokens": 0.0,
+            "internal_sampling_tokens": 0.0,
+        }
 
     num_particles = max(1, int(cfg.num_particles))
     prompt = list(context)
@@ -260,7 +268,15 @@ def smc_power_sample(
         allowed_new_tokens = int(max_seq_len) - len(prompt)
         max_new_tokens = max(0, min(max_new_tokens, allowed_new_tokens))
         if max_new_tokens == 0:
-            return context.copy(), {"steps": 0.0, "num_resamples": 0.0, "avg_ess": 0.0, "final_ess": 0.0}
+            return context.copy(), {
+                "steps": 0.0,
+                "num_resamples": 0.0,
+                "avg_ess": 0.0,
+                "final_ess": 0.0,
+                "output_tokens": 0.0,
+                "sampling_tokens": 0.0,
+                "internal_sampling_tokens": 0.0,
+            }
 
     eos_id = eos_token_id
     if eos_id is None:
@@ -307,6 +323,7 @@ def smc_power_sample(
     ess_sum = 0.0
     ess_count = 0
     steps_done = 0
+    total_sampling_tokens = 0
 
     proposal_temperature = float(cfg.proposal_temperature)
     if proposal_temperature <= 0:
@@ -372,6 +389,7 @@ def smc_power_sample(
 
         # Sample from q.
         sampled_ids = torch.multinomial(torch.exp(log_q), num_samples=1, generator=generator).squeeze(1)
+        total_sampling_tokens += int((~already_finished).sum().item())
 
         if eos_tensor is not None:
             # Absorb once EOS has been sampled.
@@ -441,10 +459,14 @@ def smc_power_sample(
         chosen = chosen[: eos_pos + 1]
 
     out = prompt + [int(tok) for tok in chosen]
+    output_tokens = max(len(out) - len(prompt), 0)
     avg_ess = float(ess_sum / max(ess_count, 1))
 
     diagnostics: Dict[str, Any] = {
         "steps": float(steps_done),
+        "output_tokens": float(output_tokens),
+        "sampling_tokens": float(total_sampling_tokens),
+        "internal_sampling_tokens": float(max(total_sampling_tokens - output_tokens, 0)),
         "num_particles": float(num_particles),
         "num_resamples": float(num_resamples),
         "avg_ess": avg_ess,

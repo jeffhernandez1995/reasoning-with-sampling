@@ -214,12 +214,22 @@ def approx_power_sample(
 
     max_new_tokens = _clamp_new_tokens(max_new_tokens, len(context), scorer.max_seq_len)
     if max_new_tokens <= 0:
-        return context.copy(), {"steps": 0.0, "rollouts": 0.0, "rollout_tokens": 0.0}
+        return context.copy(), {
+            "steps": 0.0,
+            "rollouts": 0.0,
+            "rollout_tokens": 0.0,
+            "candidate_tokens": 0.0,
+            "output_tokens": 0.0,
+            "sampling_tokens": 0.0,
+            "internal_sampling_tokens": 0.0,
+        }
 
     seq = context.copy()
     steps = 0
     total_rollouts = 0
     total_rollout_tokens = 0
+    total_candidate_tokens = 0
+    total_sampling_tokens = 0
 
     if block_size == 1:
         while (len(seq) - len(context)) < max_new_tokens:
@@ -266,7 +276,9 @@ def approx_power_sample(
                             rollout_logp[i, :] = logp_sums_t[local_idx]
                             rollout_lengths[i, :] = rollout_lengths_t[local_idx]
                         total_rollouts += len(non_terminal) * m
-                        total_rollout_tokens += int(sum(len(tokens) for per_prefix in conts for tokens in per_prefix))
+                        rollout_token_count = int(sum(len(tokens) for per_prefix in conts for tokens in per_prefix))
+                        total_rollout_tokens += rollout_token_count
+                        total_sampling_tokens += rollout_token_count
 
                 probs = _compute_power_probs(
                     logp_items=logp_items,
@@ -281,13 +293,19 @@ def approx_power_sample(
             token = int(cand_tokens[choice])
             seq.append(token)
             steps += 1
+            total_sampling_tokens += 1
             if token == eos_id:
                 break
 
+        internal_sampling_tokens = max(total_sampling_tokens - steps, 0)
         return seq, {
             "steps": float(steps),
             "rollouts": float(total_rollouts),
             "rollout_tokens": float(total_rollout_tokens),
+            "candidate_tokens": float(total_candidate_tokens),
+            "output_tokens": float(steps),
+            "sampling_tokens": float(total_sampling_tokens),
+            "internal_sampling_tokens": float(internal_sampling_tokens),
         }
 
     # Appendix-B style block version.
@@ -315,6 +333,9 @@ def approx_power_sample(
             )
             candidate_blocks = conts[0]
             candidate_logp = np.asarray(logp_sums[0], dtype=np.float64)
+            candidate_token_count = int(sum(len(tokens) for tokens in candidate_blocks))
+            total_candidate_tokens += candidate_token_count
+            total_sampling_tokens += candidate_token_count
 
             order = np.argsort(candidate_logp)[::-1][:k]
             top_blocks = [candidate_blocks[i] for i in order]
@@ -349,6 +370,9 @@ def approx_power_sample(
         )
         candidate_blocks = conts[0]
         candidate_logp = np.asarray(logp_sums[0], dtype=np.float64)
+        candidate_token_count = int(sum(len(tokens) for tokens in candidate_blocks))
+        total_candidate_tokens += candidate_token_count
+        total_sampling_tokens += candidate_token_count
 
         order = np.argsort(candidate_logp)[::-1][:k]
         top_blocks = [candidate_blocks[i] for i in order]
@@ -388,7 +412,9 @@ def approx_power_sample(
                         rollout_logp[i, :] = logp_sums2_t[local_idx]
                         rollout_lengths[i, :] = rollout_lengths2_t[local_idx]
                     total_rollouts += len(non_terminal) * m
-                    total_rollout_tokens += int(sum(len(tokens) for per_prefix in conts2 for tokens in per_prefix))
+                    rollout_token_count = int(sum(len(tokens) for per_prefix in conts2 for tokens in per_prefix))
+                    total_rollout_tokens += rollout_token_count
+                    total_sampling_tokens += rollout_token_count
 
             probs = _compute_power_probs(
                 logp_items=top_logp,
@@ -411,8 +437,13 @@ def approx_power_sample(
         if seq and seq[-1] == eos_id:
             break
 
+    internal_sampling_tokens = max(total_sampling_tokens - steps, 0)
     return seq, {
         "steps": float(steps),
         "rollouts": float(total_rollouts),
         "rollout_tokens": float(total_rollout_tokens),
+        "candidate_tokens": float(total_candidate_tokens),
+        "output_tokens": float(steps),
+        "sampling_tokens": float(total_sampling_tokens),
+        "internal_sampling_tokens": float(internal_sampling_tokens),
     }

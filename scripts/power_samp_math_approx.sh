@@ -9,6 +9,8 @@
 #SBATCH --array=0-39
 #SBATCH -o /scratch/%u/logs/%x-%A_%a.out
 #SBATCH -e /scratch/%u/logs/%x-%A_%a.err
+#SBATCH --mail-user=jeh16@rice.edu
+#SBATCH --mail-type=BEGIN,END,FAIL
 
 set -euo pipefail
 

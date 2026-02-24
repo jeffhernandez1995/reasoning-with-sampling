@@ -143,7 +143,12 @@ if __name__ == "__main__":
         base_seconds = std_sample.latency_seconds
         temp_seconds = naive_sample.latency_seconds
         power_seconds = method_sample.latency_seconds
+        temp_output_tokens = len(naive_sample.token_ids)
+        std_output_tokens = len(std_sample.token_ids)
         acceptance_ratio = method_sample.metadata.get("acceptance_ratio")
+        sampling_tokens = method_sample.metadata.get("sampling_tokens")
+        output_tokens = method_sample.metadata.get("output_tokens")
+        internal_sampling_tokens = method_sample.metadata.get("internal_sampling_tokens")
         total_base_seconds += base_seconds
         total_temp_seconds += temp_seconds
         total_power_seconds += power_seconds
@@ -168,9 +173,16 @@ if __name__ == "__main__":
                 "base_sampling_avg_seconds_so_far": avg_base_seconds,
                 "temp_sampling_seconds": temp_seconds,
                 "temp_sampling_avg_seconds_so_far": avg_temp_seconds,
+                "temp_output_tokens": temp_output_tokens,
+                "temp_sampling_tokens": temp_output_tokens,
                 "power_sampling_seconds": power_seconds,
                 "power_sampling_avg_seconds_so_far": avg_power_seconds,
+                "std_output_tokens": std_output_tokens,
+                "std_sampling_tokens": std_output_tokens,
                 "power_acceptance_ratio": acceptance_ratio,
+                "power_sampling_tokens": sampling_tokens,
+                "power_output_tokens": output_tokens,
+                "power_internal_sampling_tokens": internal_sampling_tokens,
                 "naive_reward": naive_reward,
                 "std_reward": std_reward,
                 "mcmc_reward": method_reward,
@@ -188,7 +200,14 @@ if __name__ == "__main__":
                 "reward/naive": naive_reward,
                 "reward/std": std_reward,
                 "reward/mcmc": method_reward,
+                "sampling/temp_output_tokens": temp_output_tokens,
+                "sampling/temp_sampling_tokens": temp_output_tokens,
+                "sampling/std_output_tokens": std_output_tokens,
+                "sampling/std_sampling_tokens": std_output_tokens,
                 "sampling/acceptance_ratio": acceptance_ratio,
+                "sampling/power_sampling_tokens": sampling_tokens,
+                "sampling/power_output_tokens": output_tokens,
+                "sampling/power_internal_sampling_tokens": internal_sampling_tokens,
             },
             step=step_idx,
         )
@@ -206,7 +225,13 @@ if __name__ == "__main__":
                 "base_sampling_seconds": base_seconds,
                 "temp_sampling_seconds": temp_seconds,
                 "power_sampling_seconds": power_seconds,
+                "temp_output_tokens": temp_output_tokens,
+                "temp_sampling_tokens": temp_output_tokens,
+                "std_output_tokens": std_output_tokens,
+                "std_sampling_tokens": std_output_tokens,
                 "power_acceptance_ratio": acceptance_ratio,
+                "power_sampling_tokens": sampling_tokens,
+                "power_output_tokens": output_tokens,
             }
         )
 

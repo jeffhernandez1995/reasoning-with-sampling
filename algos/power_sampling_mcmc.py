@@ -8,7 +8,7 @@ implementation in `power_samp_utils.py` so existing behavior is preserved.
 from __future__ import annotations
 
 import random
-from typing import List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import torch
@@ -97,12 +97,19 @@ def mcmc_power_samp(
     mcmc_steps: int,
     max_new_tokens: int,
     block_num: int = 16,
+    return_diagnostics: bool = False,
 ):
-    """Power sampling with autoregressive MCMC."""
+    """Power sampling with autoregressive MCMC.
+
+    Args:
+      return_diagnostics: If True, appends a diagnostics dictionary to the
+        return tuple.
+    """
     c = len(context)
     generated = context.copy() if context is not None else []
     log_probs_norm: List[float] = []
     log_probs_unnorm: List[float] = []
+    total_sampling_tokens = 0
 
     assert max_new_tokens % block_num == 0
     jump_size = int(max_new_tokens // block_num)
@@ -122,6 +129,7 @@ def mcmc_power_samp(
         generated, lp_norm, lp_unnorm = naive_temp(p, generated, temp=temp, seq_len=jump_size + len(generated))
         log_probs_norm.extend(lp_norm)
         log_probs_unnorm.extend(lp_unnorm)
+        total_sampling_tokens += len(lp_norm)
 
         for _ in tqdm(range(mcmc_steps), desc=f"power_samp block {block_idx + 1}/{block_num}", leave=False):
             attempts += 1
@@ -129,6 +137,7 @@ def mcmc_power_samp(
             idx = random.randint(c, t - 1)
 
             proposal, log_prob_prop, target_log_prob_prop = naive_temp(p, generated[:idx], temp=temp, seq_len=t)
+            total_sampling_tokens += len(log_prob_prop)
             s = len(proposal)
             assert len(log_prob_prop) == s - idx
             assert len(target_log_prob_prop) == s - idx
@@ -152,7 +161,23 @@ def mcmc_power_samp(
             log_probs_unnorm = log_probs_unnorm[: eos_idx + 1]
             print(f"[power_samp] stopped early due to EOS at block {block_idx + 1}/{block_num}", flush=True)
             acceptance_ratio = acceptances / max(attempts, 1)
+            diagnostics: Dict[str, Any] = {
+                "output_tokens": float(max(len(generated) - c, 0)),
+                "sampling_tokens": float(total_sampling_tokens),
+                "internal_sampling_tokens": float(max(total_sampling_tokens - max(len(generated) - c, 0), 0)),
+                "acceptance_ratio": float(acceptance_ratio),
+            }
+            if return_diagnostics:
+                return generated, log_probs_norm, log_probs_unnorm, acceptance_ratio, diagnostics
             return generated, log_probs_norm, log_probs_unnorm, acceptance_ratio
 
     acceptance_ratio = acceptances / max(attempts, 1)
+    diagnostics = {
+        "output_tokens": float(max(len(generated) - c, 0)),
+        "sampling_tokens": float(total_sampling_tokens),
+        "internal_sampling_tokens": float(max(total_sampling_tokens - max(len(generated) - c, 0), 0)),
+        "acceptance_ratio": float(acceptance_ratio),
+    }
+    if return_diagnostics:
+        return generated, log_probs_norm, log_probs_unnorm, acceptance_ratio, diagnostics
     return generated, log_probs_norm, log_probs_unnorm, acceptance_ratio
