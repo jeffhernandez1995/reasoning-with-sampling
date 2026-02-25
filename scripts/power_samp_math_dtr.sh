@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -J psamp-math-approx
+#SBATCH -J psamp-math-dtr
 #SBATCH -p commons
 #SBATCH -N 1
 #SBATCH --time=24:00:00
@@ -15,7 +15,6 @@
 set -euo pipefail
 
 # --- map array id -> (batch_idx, seed) ---
-
 NUM_SHARDS=5
 NUM_SEEDS=8
 TOTAL_TASKS=$((NUM_SHARDS * NUM_SEEDS))
@@ -49,7 +48,7 @@ export CUDA_LAUNCH_BLOCKING="0"
 
 # --- Paths / run params ---
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [[ -n "${SLURM_SUBMIT_DIR:-}" && -f "${SLURM_SUBMIT_DIR}/power_samp_math_approx.py" ]]; then
+if [[ -n "${SLURM_SUBMIT_DIR:-}" && -f "${SLURM_SUBMIT_DIR}/power_samp_math_dtr.py" ]]; then
   REPO_ROOT="${SLURM_SUBMIT_DIR}"
 else
   REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -58,18 +57,17 @@ cd "${REPO_ROOT}"
 mkdir -p "/scratch/$USER/logs" "${HF_HOME}"
 
 # Force run config in-script to avoid inheriting submit-shell overrides.
+SAMPLING_METHOD="power_dtr"
 MODEL="qwen_math"
 TEMP="0.25"
+MAX_NEW_TOKENS="3072"
 TOP_K="8"
-# Keep this run lightweight; paper reports L=10.
-CANDIDATE_POOL_SIZE="8"
-# Keep this run lightweight; paper reports Mt=8.
-ROLLOUTS_PER_CANDIDATE="4"
-# Keep this run lightweight; paper reports H=192.
-LOOKAHEAD_TOKENS="32"
-# Keep this run lightweight; paper reports B=192.
-BLOCK_SIZE="32"
-USE_JACKKNIFE="true"
+LOOKAHEAD_TOKENS="16"
+BRANCH_FACTOR="8"
+BEAM_WIDTH="16"
+INCLUDE_EOS_IN_BRANCH="true"
+PRUNE_LOGW_MARGIN=""
+MAX_FORWARD_BATCH_SIZE=""
 SAVE_STR="/scratch/$USER/reasoning-with-sampling/results"
 MAX_QUESTIONS=""
 SAVE_EVERY="5"
@@ -78,8 +76,11 @@ CUDA_SYNC="false"
 mkdir -p "${SAVE_STR}"
 
 EXTRA_ARGS=""
-if [[ -n "${LOOKAHEAD_TOKENS}" ]]; then
-  EXTRA_ARGS="${EXTRA_ARGS} --lookahead_tokens ${LOOKAHEAD_TOKENS}"
+if [[ -n "${PRUNE_LOGW_MARGIN}" ]]; then
+  EXTRA_ARGS="${EXTRA_ARGS} --prune_logw_margin ${PRUNE_LOGW_MARGIN}"
+fi
+if [[ -n "${MAX_FORWARD_BATCH_SIZE}" ]]; then
+  EXTRA_ARGS="${EXTRA_ARGS} --max_forward_batch_size ${MAX_FORWARD_BATCH_SIZE}"
 fi
 if [[ -n "${MAX_QUESTIONS}" ]]; then
   EXTRA_ARGS="${EXTRA_ARGS} --max_questions ${MAX_QUESTIONS}"
@@ -90,26 +91,28 @@ echo "== Node =="
 hostname
 echo "SLURM_JOB_ID=${SLURM_JOB_ID} ARRAY_TASK=${SLURM_ARRAY_TASK_ID}"
 echo "BATCH_IDX=${BATCH_IDX} SEED=${SEED}"
-echo "MODEL=${MODEL} TEMP=${TEMP}"
-echo "TOP_K=${TOP_K} CANDIDATE_POOL_SIZE=${CANDIDATE_POOL_SIZE} ROLLOUTS_PER_CANDIDATE=${ROLLOUTS_PER_CANDIDATE}"
-echo "LOOKAHEAD_TOKENS=${LOOKAHEAD_TOKENS} BLOCK_SIZE=${BLOCK_SIZE} USE_JACKKNIFE=${USE_JACKKNIFE}"
+echo "SAMPLING_METHOD=${SAMPLING_METHOD} MODEL=${MODEL} TEMP=${TEMP} MAX_NEW_TOKENS=${MAX_NEW_TOKENS}"
+echo "TOP_K=${TOP_K} LOOKAHEAD_TOKENS=${LOOKAHEAD_TOKENS} BRANCH_FACTOR=${BRANCH_FACTOR} BEAM_WIDTH=${BEAM_WIDTH}"
+echo "INCLUDE_EOS_IN_BRANCH=${INCLUDE_EOS_IN_BRANCH} PRUNE_LOGW_MARGIN=${PRUNE_LOGW_MARGIN} MAX_FORWARD_BATCH_SIZE=${MAX_FORWARD_BATCH_SIZE}"
 echo "MAX_QUESTIONS=${MAX_QUESTIONS} SAVE_EVERY=${SAVE_EVERY} DEBUG_VERBOSE=${DEBUG_VERBOSE} CUDA_SYNC=${CUDA_SYNC}"
 echo "PYTHONFAULTHANDLER=${PYTHONFAULTHANDLER} TORCH_SHOW_CPP_STACKTRACES=${TORCH_SHOW_CPP_STACKTRACES} CUDA_LAUNCH_BLOCKING=${CUDA_LAUNCH_BLOCKING}"
 echo "REPO_ROOT=${REPO_ROOT}"
 echo "SAVE_STR=${SAVE_STR}"
 echo
 
-RUN_CMD="python \"${REPO_ROOT}/power_samp_math_approx.py\" \
+RUN_CMD="python \"${REPO_ROOT}/power_samp_math_dtr.py\" \
+  --sampling_method \"${SAMPLING_METHOD}\" \
   --batch_idx \"${BATCH_IDX}\" \
   --temp \"${TEMP}\" \
   --seed \"${SEED}\" \
   --model \"${MODEL}\" \
   --save_str \"${SAVE_STR}\" \
+  --max_new_tokens \"${MAX_NEW_TOKENS}\" \
   --top_k \"${TOP_K}\" \
-  --candidate_pool_size \"${CANDIDATE_POOL_SIZE}\" \
-  --rollouts_per_candidate \"${ROLLOUTS_PER_CANDIDATE}\" \
-  --block_size \"${BLOCK_SIZE}\" \
-  --use_jackknife \"${USE_JACKKNIFE}\" \
+  --lookahead_tokens \"${LOOKAHEAD_TOKENS}\" \
+  --branch_factor \"${BRANCH_FACTOR}\" \
+  --beam_width \"${BEAM_WIDTH}\" \
+  --include_eos_in_branch \"${INCLUDE_EOS_IN_BRANCH}\" \
   ${EXTRA_ARGS}"
 
 srun --ntasks=1 bash -lc "

@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH -J psamp-math-smc-apf
+#SBATCH -J psamp-math-smc
 #SBATCH -p commons
 #SBATCH -N 1
 #SBATCH --time=24:00:00
 #SBATCH --gres=gpu:h200:1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=26
-#SBATCH --array=0-39
+#SBATCH --array=0-9
 #SBATCH -o /scratch/%u/logs/%x-%A_%a.out
 #SBATCH -e /scratch/%u/logs/%x-%A_%a.err
 #SBATCH --mail-user=jeh16@rice.edu
@@ -16,7 +16,7 @@ set -euo pipefail
 
 # --- map array id -> (batch_idx, seed) ---
 NUM_SHARDS=5
-NUM_SEEDS=8
+NUM_SEEDS=2
 TOTAL_TASKS=$((NUM_SHARDS * NUM_SEEDS))
 if [[ "${SLURM_ARRAY_TASK_ID}" -ge "${TOTAL_TASKS}" ]]; then
   echo "SLURM_ARRAY_TASK_ID=${SLURM_ARRAY_TASK_ID} out of range for ${TOTAL_TASKS} tasks" >&2
@@ -57,7 +57,7 @@ cd "${REPO_ROOT}"
 mkdir -p "/scratch/$USER/logs" "${HF_HOME}"
 
 # Force run config in-script to avoid inheriting submit-shell overrides.
-SAMPLING_METHOD="power_smc_apf"
+SAMPLING_METHOD="power_smc"
 MODEL="qwen_math"
 TEMP="0.25"
 MAX_NEW_TOKENS="3072"
@@ -128,8 +128,18 @@ RUN_CMD="python \"${REPO_ROOT}/power_samp_math_smc.py\" \
   ${EXTRA_ARGS}"
 
 srun --ntasks=1 bash -lc "
-source \"\$(conda info --base)/etc/profile.d/conda.sh\" &&
+source \"$HOME/miniconda3/etc/profile.d/conda.sh\" &&
 conda activate psamp &&
+unset LD_PRELOAD &&
+if [[ -n \"\${LD_LIBRARY_PATH:-}\" ]]; then
+  CLEAN_LD_LIBRARY_PATH=\$(printf '%s' \"\$LD_LIBRARY_PATH\" | tr ':' '\n' | grep -v '^/opt/apps/xalt/default/lib64$' | paste -sd: -);
+else
+  CLEAN_LD_LIBRARY_PATH='';
+fi &&
+export LD_LIBRARY_PATH=\"\$CONDA_PREFIX/lib\${CLEAN_LD_LIBRARY_PATH:+:\$CLEAN_LD_LIBRARY_PATH}\" &&
+export SSL_CERT_FILE=\"\$CONDA_PREFIX/ssl/cert.pem\" &&
+echo \"CONDA_PREFIX=\$CONDA_PREFIX\" &&
+echo \"LD_LIBRARY_PATH=\$LD_LIBRARY_PATH\" &&
 cd \"${REPO_ROOT}\" &&
 echo \"CUDA_VISIBLE_DEVICES=\${CUDA_VISIBLE_DEVICES}\" &&
 python -V &&

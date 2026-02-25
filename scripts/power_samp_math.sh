@@ -70,8 +70,18 @@ echo "SAVE_STR=${SAVE_STR}"
 echo
 
 srun --ntasks=1 bash -lc "
-source \"\$(conda info --base)/etc/profile.d/conda.sh\" &&
+source \"$HOME/miniconda3/etc/profile.d/conda.sh\" &&
 conda activate psamp &&
+unset LD_PRELOAD &&
+if [[ -n \"\${LD_LIBRARY_PATH:-}\" ]]; then
+  CLEAN_LD_LIBRARY_PATH=\$(printf '%s' \"\$LD_LIBRARY_PATH\" | tr ':' '\n' | grep -v '^/opt/apps/xalt/default/lib64$' | paste -sd: -);
+else
+  CLEAN_LD_LIBRARY_PATH='';
+fi &&
+export LD_LIBRARY_PATH=\"\$CONDA_PREFIX/lib\${CLEAN_LD_LIBRARY_PATH:+:\$CLEAN_LD_LIBRARY_PATH}\" &&
+export SSL_CERT_FILE=\"\$CONDA_PREFIX/ssl/cert.pem\" &&
+echo \"CONDA_PREFIX=\$CONDA_PREFIX\" &&
+echo \"LD_LIBRARY_PATH=\$LD_LIBRARY_PATH\" &&
 cd \"${REPO_ROOT}\" &&
 python \"${REPO_ROOT}/power_samp_math.py\" \
   --batch_idx \"${BATCH_IDX}\" \
