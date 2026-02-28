@@ -16,6 +16,7 @@ from algos.power_sampling_cumulant import PowerSamplerCumulantConfig, cumulant_p
 from algos.power_sampling_dtr import PowerSamplerDTRConfig, dtr_power_sample
 from algos.power_sampling_mcmc import AutoregressiveSampler, mcmc_power_samp
 from algos.power_sampling_smc import PowerSamplerSMCConfig, smc_power_sample
+from algos.power_sampling_tilted_cgf import PowerSamplerTiltedCGFConfig, tilted_cgf_power_sample
 
 
 MODEL_NAME_BY_ALIAS = {
@@ -408,6 +409,174 @@ class _ApproxPowerHFScorer:
 
         return continuation_rows, logp_rows, mean_logp_rows, var_logp_rows
 
+    @torch.inference_mode()
+    def sample_continuations_with_cgf(
+        self,
+        prefixes: List[List[int]],
+        *,
+        max_new_tokens: int,
+        n: int,
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+        top_k: Optional[int] = None,
+        eos_token_id: Optional[int] = None,
+    ):
+        if not prefixes:
+            return [], [], []
+
+        n = max(0, int(n))
+        max_new_tokens = max(0, int(max_new_tokens))
+        if n == 0:
+            empty_continuations = [[[] for _ in range(0)] for _ in prefixes]
+            empty_logp = [[0.0 for _ in range(0)] for _ in prefixes]
+            empty_logz = [[0.0 for _ in range(0)] for _ in prefixes]
+            return empty_continuations, empty_logp, empty_logz
+        if max_new_tokens == 0:
+            empty_continuations = [[[] for _ in range(n)] for _ in prefixes]
+            empty_logp = [[0.0 for _ in range(n)] for _ in prefixes]
+            empty_logz = [[0.0 for _ in range(n)] for _ in prefixes]
+            return empty_continuations, empty_logp, empty_logz
+
+        eos_id = eos_token_id if eos_token_id is not None else self.tokenizer.eos_token_id
+        eos_id_int = None if eos_id is None else int(eos_id)
+        top_k_val = None if top_k is None else int(top_k)
+        top_p_val = float(top_p)
+        temperature_val = float(temperature)
+        if temperature_val <= 0:
+            raise ValueError("temperature must be > 0.")
+        beta = 1.0 / temperature_val
+
+        continuation_rows: List[List[List[int]]] = [[[] for _ in range(n)] for _ in prefixes]
+        logp_rows: List[List[float]] = [[0.0 for _ in range(n)] for _ in prefixes]
+        logz_rows: List[List[float]] = [[0.0 for _ in range(n)] for _ in prefixes]
+
+        clipped_prefixes: List[List[int]] = prefixes
+        if self.max_seq_len is not None:
+            max_len = int(self.max_seq_len)
+            clipped_prefixes = [prefix[-max_len:] if len(prefix) > max_len else prefix for prefix in prefixes]
+
+        def _apply_top_k(logits: torch.Tensor) -> torch.Tensor:
+            if top_k_val is None or top_k_val <= 0:
+                return logits
+            k = min(int(top_k_val), int(logits.shape[-1]))
+            if k >= int(logits.shape[-1]):
+                return logits
+            top_values, _ = torch.topk(logits, k=k, dim=-1)
+            kth = top_values[:, -1].unsqueeze(-1)
+            return torch.where(logits < kth, torch.full_like(logits, -float("inf")), logits)
+
+        def _apply_top_p(logits: torch.Tensor) -> torch.Tensor:
+            if top_p_val >= 1.0:
+                return logits
+            if top_p_val <= 0.0:
+                argmax_ids = torch.argmax(logits, dim=-1, keepdim=True)
+                return torch.full_like(logits, -float("inf")).scatter(1, argmax_ids, logits.gather(1, argmax_ids))
+            sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+            sorted_probs = F.softmax(sorted_logits, dim=-1)
+            cumulative = torch.cumsum(sorted_probs, dim=-1)
+            sorted_mask = cumulative > top_p_val
+            sorted_mask[:, 0] = False
+            sorted_logits = sorted_logits.masked_fill(sorted_mask, -float("inf"))
+            return logits.scatter(1, sorted_indices, sorted_logits)
+
+        groups: Dict[int, List[int]] = {}
+        for i, prefix in enumerate(clipped_prefixes):
+            groups.setdefault(len(prefix), []).append(i)
+
+        pad_token = torch.tensor(self._pad_token_id, device=self.device, dtype=torch.long)
+
+        for _, group_indices in groups.items():
+            flat_prefixes = []
+            flat_meta = []
+            for idx in group_indices:
+                for sample_idx in range(n):
+                    flat_prefixes.append(clipped_prefixes[idx])
+                    flat_meta.append((idx, sample_idx))
+
+            batch_input_ids = torch.tensor(flat_prefixes, dtype=torch.long, device=self.device)
+            batch_size, prefix_len = batch_input_ids.shape
+            full_attention_mask = torch.ones(
+                (batch_size, prefix_len + max_new_tokens),
+                dtype=batch_input_ids.dtype,
+                device=self.device,
+            )
+            outputs = self.model(
+                input_ids=batch_input_ids,
+                attention_mask=full_attention_mask[:, :prefix_len],
+                use_cache=True,
+            )
+            next_logits = outputs.logits[:, -1, :].float()
+            past_key_values = outputs.past_key_values
+
+            generated = torch.full(
+                (batch_size, max_new_tokens),
+                self._pad_token_id,
+                dtype=torch.long,
+                device=self.device,
+            )
+            base_logp_sums = torch.zeros((batch_size,), dtype=torch.float32, device=self.device)
+            logz_sums = torch.zeros((batch_size,), dtype=torch.float32, device=self.device)
+            finished = torch.zeros((batch_size,), dtype=torch.bool, device=self.device)
+            generated_steps = 0
+            current_len = int(prefix_len)
+
+            for step_idx in range(max_new_tokens):
+                base_logits = next_logits
+                base_log_probs = F.log_softmax(base_logits, dim=-1)
+                logz_beta = torch.logsumexp(beta * base_log_probs, dim=-1)
+
+                proposal_logits = base_logits
+                if temperature_val != 1.0:
+                    proposal_logits = proposal_logits / temperature_val
+                proposal_logits = _apply_top_k(proposal_logits)
+                proposal_logits = _apply_top_p(proposal_logits)
+
+                proposal_log_probs = F.log_softmax(proposal_logits, dim=-1)
+                proposal_probs = torch.exp(proposal_log_probs)
+                sampled_ids = torch.multinomial(proposal_probs, num_samples=1).squeeze(1)
+                sampled_base_logp = base_log_probs.gather(1, sampled_ids.unsqueeze(1)).squeeze(1)
+
+                active_mask = ~finished
+                sampled_ids = torch.where(finished, pad_token, sampled_ids)
+                sampled_base_logp = torch.where(active_mask, sampled_base_logp, torch.zeros_like(sampled_base_logp))
+                logz_beta = torch.where(active_mask, logz_beta, torch.zeros_like(logz_beta))
+
+                generated[:, step_idx] = sampled_ids
+                base_logp_sums += sampled_base_logp
+                logz_sums += logz_beta
+                generated_steps = step_idx + 1
+
+                if eos_id_int is not None:
+                    finished = finished | sampled_ids.eq(eos_id_int)
+                    if bool(torch.all(finished).item()):
+                        break
+
+                current_len += 1
+                outputs = self.model(
+                    input_ids=sampled_ids.unsqueeze(1),
+                    attention_mask=full_attention_mask[:, :current_len],
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                )
+                next_logits = outputs.logits[:, -1, :].float()
+                past_key_values = outputs.past_key_values
+
+            generated_rows = generated[:, :generated_steps].detach().cpu().tolist()
+            base_logp_values = base_logp_sums.detach().cpu().tolist()
+            logz_values = logz_sums.detach().cpu().tolist()
+            for row_idx, (orig_idx, sample_idx) in enumerate(flat_meta):
+                row_tokens: List[int] = []
+                for tok in generated_rows[row_idx]:
+                    tok_int = int(tok)
+                    row_tokens.append(tok_int)
+                    if eos_id_int is not None and tok_int == eos_id_int:
+                        break
+                continuation_rows[orig_idx][sample_idx] = row_tokens
+                logp_rows[orig_idx][sample_idx] = float(base_logp_values[row_idx])
+                logz_rows[orig_idx][sample_idx] = float(logz_values[row_idx])
+
+        return continuation_rows, logp_rows, logz_rows
+
 
 class GenericSampler:
     """Shared sampling engine that cleanly separates sampling from task-specific evaluation."""
@@ -427,6 +596,7 @@ class GenericSampler:
             "power": self._sample_power,
             "power_approx": self._sample_power_approx,
             "power_cumulant": self._sample_power_cumulant,
+            "power_tilted_cgf": self._sample_power_tilted_cgf,
             "power_dtr": self._sample_power_dtr,
             "power_smc": self._sample_power_smc,
             "power_smc_apf": self._sample_power_smc,
@@ -649,6 +819,12 @@ class GenericSampler:
             value = method_config.get(name, default)
             return float(value)
 
+        def _as_bool(name: str, default: bool) -> bool:
+            value = method_config.get(name, default)
+            if isinstance(value, bool):
+                return value
+            return str(value).strip().lower() in {"1", "true", "t", "yes", "y"}
+
         cfg = PowerSamplerCumulantConfig(
             temp=float(temperature),
             top_k=_as_int("top_k", 8),
@@ -657,6 +833,11 @@ class GenericSampler:
             block_size=_as_int("block_size", 192),
             moment_rollouts=_as_int("moment_rollouts", 1),
             cumulant_order=_as_int("cumulant_order", 2),
+            zeta_weight=_as_float("zeta_weight", 1.0),
+            varentropy_coef=_as_float("varentropy_coef", 1.0),
+            length_normalize_logp=_as_bool("length_normalize_logp", False),
+            length_penalty=_as_float("length_penalty", 1.0),
+            rollout_stop_on_eos=_as_bool("rollout_stop_on_eos", True),
             rollout_temperature=_as_float("rollout_temperature", 1.0),
             rollout_top_p=_as_float("rollout_top_p", 1.0),
             rollout_top_k=_as_opt_int("rollout_top_k", None),
@@ -693,6 +874,98 @@ class GenericSampler:
 
         return SamplingOutput(
             method="power_cumulant",
+            completion=completion,
+            token_ids=generated_token_ids,
+            latency_seconds=latency_seconds,
+            metadata=metadata,
+            full_completion=full_completion,
+            full_token_ids=sampled_token_ids,
+        )
+
+    def _sample_power_tilted_cgf(
+        self,
+        input_ids,
+        temperature: float,
+        mcmc_steps: int,
+        max_new_tokens: int,
+        method_config: Optional[Dict[str, Any]] = None,
+    ) -> SamplingOutput:
+        del mcmc_steps  # Unused for tilted-CGF approximation.
+        method_config = method_config or {}
+
+        def _as_int(name: str, default: int) -> int:
+            value = method_config.get(name, default)
+            return int(value)
+
+        def _as_opt_int(name: str, default: Optional[int]) -> Optional[int]:
+            value = method_config.get(name, default)
+            if value is None:
+                return None
+            return int(value)
+
+        def _as_float(name: str, default: float) -> float:
+            value = method_config.get(name, default)
+            return float(value)
+
+        def _as_opt_float(name: str, default: Optional[float]) -> Optional[float]:
+            value = method_config.get(name, default)
+            if value is None:
+                return None
+            return float(value)
+
+        def _as_bool(name: str, default: bool) -> bool:
+            value = method_config.get(name, default)
+            if isinstance(value, bool):
+                return value
+            return str(value).strip().lower() in {"1", "true", "t", "yes", "y"}
+
+        cfg = PowerSamplerTiltedCGFConfig(
+            temp=float(temperature),
+            top_k=_as_int("top_k", 8),
+            candidate_pool_size=_as_int("candidate_pool_size", 32),
+            lookahead_tokens=_as_opt_int("lookahead_tokens", 192),
+            block_size=_as_int("block_size", 192),
+            rollouts_per_candidate=_as_int("rollouts_per_candidate", 1),
+            proposal_temperature=_as_opt_float("proposal_temperature", None),
+            proposal_top_p=_as_float("proposal_top_p", 1.0),
+            proposal_top_k=_as_opt_int("proposal_top_k", None),
+            zeta_weight=_as_float("zeta_weight", 1.0),
+            length_normalize_logp=_as_bool("length_normalize_logp", False),
+            length_penalty=_as_float("length_penalty", 1.0),
+            rollout_stop_on_eos=_as_bool("rollout_stop_on_eos", True),
+        )
+
+        prompt_token_ids = input_ids[0].detach().cpu().tolist()
+        eos_id = method_config.get("eos_token_id", self.tokenizer.eos_token_id)
+        seed_value = method_config.get("seed")
+        rng = np.random.default_rng(seed=seed_value)
+
+        start = perf_counter()
+        sampled_token_ids, diag = tilted_cgf_power_sample(
+            self.approx_power_scorer,
+            prompt_token_ids,
+            cfg=cfg,
+            max_new_tokens=max_new_tokens,
+            eos_token_id=eos_id,
+            rng=rng,
+        )
+        latency_seconds = perf_counter() - start
+
+        generated_token_ids = sampled_token_ids
+        if sampled_token_ids[: len(prompt_token_ids)] == prompt_token_ids:
+            generated_token_ids = sampled_token_ids[len(prompt_token_ids) :]
+
+        completion = self.tokenizer.decode(generated_token_ids, skip_special_tokens=True)
+        full_completion = self.tokenizer.decode(sampled_token_ids, skip_special_tokens=True)
+
+        metadata: Dict[str, Any] = {
+            "temperature": float(temperature),
+            "tilted_cgf_config": asdict(cfg),
+        }
+        metadata.update(diag)
+
+        return SamplingOutput(
+            method="power_tilted_cgf",
             completion=completion,
             token_ids=generated_token_ids,
             latency_seconds=latency_seconds,

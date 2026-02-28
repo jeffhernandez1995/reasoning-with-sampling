@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -J psamp-math-cumulant
+#SBATCH -J psamp-math-tilted-cgf
 #SBATCH -p commons
 #SBATCH -N 1
 #SBATCH --time=24:00:00
@@ -49,7 +49,7 @@ export CUDA_LAUNCH_BLOCKING="0"
 
 # --- Paths / run params ---
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [[ -n "${SLURM_SUBMIT_DIR:-}" && -f "${SLURM_SUBMIT_DIR}/power_samp_math_cumulant.py" ]]; then
+if [[ -n "${SLURM_SUBMIT_DIR:-}" && -f "${SLURM_SUBMIT_DIR}/power_samp_math_approx.py" ]]; then
   REPO_ROOT="${SLURM_SUBMIT_DIR}"
 else
   REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -61,22 +61,17 @@ mkdir -p "/scratch/$USER/logs" "${HF_HOME}"
 MODEL="qwen_math"
 TEMP="0.25"
 TOP_K="8"
-# Keep this run lightweight.
 CANDIDATE_POOL_SIZE="8"
-# Single-path moment rollout is the default approximation.
-MOMENT_ROLLOUTS="1"
-CUMULANT_ORDER="2"
+ROLLOUTS_PER_CANDIDATE="2"
+LOOKAHEAD_TOKENS="64"
+BLOCK_SIZE="1"
+PROPOSAL_TEMPERATURE="${TEMP}"
+PROPOSAL_TOP_P="1.0"
+PROPOSAL_TOP_K=""
 ZETA_WEIGHT="1.0"
-VARENTROPY_COEF="1.0"
-LENGTH_NORMALIZE_LOGP="false"
+LENGTH_NORMALIZE_LOGP="true"
 LENGTH_PENALTY="1.0"
 ROLLOUT_STOP_ON_EOS="true"
-# Keep this run lightweight relative to paper defaults.
-LOOKAHEAD_TOKENS="32"
-BLOCK_SIZE="32"
-ROLLOUT_TEMPERATURE="1.0"
-ROLLOUT_TOP_P="1.0"
-ROLLOUT_TOP_K=""
 SAVE_STR="/scratch/$USER/reasoning-with-sampling/results"
 MAX_QUESTIONS=""
 SAVE_EVERY="5"
@@ -91,8 +86,11 @@ fi
 if [[ -n "${MAX_QUESTIONS}" ]]; then
   EXTRA_ARGS="${EXTRA_ARGS} --max_questions ${MAX_QUESTIONS}"
 fi
-if [[ -n "${ROLLOUT_TOP_K}" ]]; then
-  EXTRA_ARGS="${EXTRA_ARGS} --rollout_top_k ${ROLLOUT_TOP_K}"
+if [[ -n "${PROPOSAL_TOP_K}" ]]; then
+  EXTRA_ARGS="${EXTRA_ARGS} --proposal_top_k ${PROPOSAL_TOP_K}"
+fi
+if [[ -n "${PROPOSAL_TEMPERATURE}" ]]; then
+  EXTRA_ARGS="${EXTRA_ARGS} --proposal_temperature ${PROPOSAL_TEMPERATURE}"
 fi
 EXTRA_ARGS="${EXTRA_ARGS} --save_every ${SAVE_EVERY} --debug_verbose ${DEBUG_VERBOSE} --cuda_sync ${CUDA_SYNC}"
 
@@ -101,18 +99,19 @@ hostname
 echo "SLURM_JOB_ID=${SLURM_JOB_ID} ARRAY_TASK=${SLURM_ARRAY_TASK_ID}"
 echo "BATCH_IDX=${BATCH_IDX} SEED=${SEED}"
 echo "MODEL=${MODEL} TEMP=${TEMP}"
-echo "TOP_K=${TOP_K} CANDIDATE_POOL_SIZE=${CANDIDATE_POOL_SIZE}"
-echo "MOMENT_ROLLOUTS=${MOMENT_ROLLOUTS} CUMULANT_ORDER=${CUMULANT_ORDER} ZETA_WEIGHT=${ZETA_WEIGHT} VARENTROPY_COEF=${VARENTROPY_COEF}"
-echo "LENGTH_NORMALIZE_LOGP=${LENGTH_NORMALIZE_LOGP} LENGTH_PENALTY=${LENGTH_PENALTY} ROLLOUT_STOP_ON_EOS=${ROLLOUT_STOP_ON_EOS}"
+echo "TOP_K=${TOP_K} CANDIDATE_POOL_SIZE=${CANDIDATE_POOL_SIZE} ROLLOUTS_PER_CANDIDATE=${ROLLOUTS_PER_CANDIDATE}"
 echo "LOOKAHEAD_TOKENS=${LOOKAHEAD_TOKENS} BLOCK_SIZE=${BLOCK_SIZE}"
-echo "ROLLOUT_TEMPERATURE=${ROLLOUT_TEMPERATURE} ROLLOUT_TOP_P=${ROLLOUT_TOP_P} ROLLOUT_TOP_K=${ROLLOUT_TOP_K}"
+echo "PROPOSAL_TEMPERATURE=${PROPOSAL_TEMPERATURE} PROPOSAL_TOP_P=${PROPOSAL_TOP_P} PROPOSAL_TOP_K=${PROPOSAL_TOP_K}"
+echo "ZETA_WEIGHT=${ZETA_WEIGHT} LENGTH_NORMALIZE_LOGP=${LENGTH_NORMALIZE_LOGP} LENGTH_PENALTY=${LENGTH_PENALTY}"
+echo "ROLLOUT_STOP_ON_EOS=${ROLLOUT_STOP_ON_EOS}"
 echo "MAX_QUESTIONS=${MAX_QUESTIONS} SAVE_EVERY=${SAVE_EVERY} DEBUG_VERBOSE=${DEBUG_VERBOSE} CUDA_SYNC=${CUDA_SYNC}"
 echo "PYTHONFAULTHANDLER=${PYTHONFAULTHANDLER} TORCH_SHOW_CPP_STACKTRACES=${TORCH_SHOW_CPP_STACKTRACES} CUDA_LAUNCH_BLOCKING=${CUDA_LAUNCH_BLOCKING}"
 echo "REPO_ROOT=${REPO_ROOT}"
 echo "SAVE_STR=${SAVE_STR}"
 echo
 
-RUN_CMD="python \"${REPO_ROOT}/power_samp_math_cumulant.py\" \
+RUN_CMD="python \"${REPO_ROOT}/power_samp_math_approx.py\" \
+  --sampling_method \"power_tilted_cgf\" \
   --batch_idx \"${BATCH_IDX}\" \
   --temp \"${TEMP}\" \
   --seed \"${SEED}\" \
@@ -120,16 +119,13 @@ RUN_CMD="python \"${REPO_ROOT}/power_samp_math_cumulant.py\" \
   --save_str \"${SAVE_STR}\" \
   --top_k \"${TOP_K}\" \
   --candidate_pool_size \"${CANDIDATE_POOL_SIZE}\" \
-  --moment_rollouts \"${MOMENT_ROLLOUTS}\" \
-  --cumulant_order \"${CUMULANT_ORDER}\" \
+  --rollouts_per_candidate \"${ROLLOUTS_PER_CANDIDATE}\" \
+  --block_size \"${BLOCK_SIZE}\" \
+  --proposal_top_p \"${PROPOSAL_TOP_P}\" \
   --zeta_weight \"${ZETA_WEIGHT}\" \
-  --varentropy_coef \"${VARENTROPY_COEF}\" \
   --length_normalize_logp \"${LENGTH_NORMALIZE_LOGP}\" \
   --length_penalty \"${LENGTH_PENALTY}\" \
   --rollout_stop_on_eos \"${ROLLOUT_STOP_ON_EOS}\" \
-  --block_size \"${BLOCK_SIZE}\" \
-  --rollout_temperature \"${ROLLOUT_TEMPERATURE}\" \
-  --rollout_top_p \"${ROLLOUT_TOP_P}\" \
   ${EXTRA_ARGS}"
 
 srun --ntasks=1 bash -lc "

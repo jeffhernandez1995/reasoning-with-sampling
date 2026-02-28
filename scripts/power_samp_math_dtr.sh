@@ -6,7 +6,7 @@
 #SBATCH --gres=gpu:h200:1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=26
-#SBATCH --array=0-39
+#SBATCH --array=0-9
 #SBATCH -o /scratch/%u/logs/%x-%A_%a.out
 #SBATCH -e /scratch/%u/logs/%x-%A_%a.err
 #SBATCH --mail-user=jeh16@rice.edu
@@ -16,7 +16,7 @@ set -euo pipefail
 
 # --- map array id -> (batch_idx, seed) ---
 NUM_SHARDS=5
-NUM_SEEDS=8
+NUM_SEEDS=2
 TOTAL_TASKS=$((NUM_SHARDS * NUM_SEEDS))
 if [[ "${SLURM_ARRAY_TASK_ID}" -ge "${TOTAL_TASKS}" ]]; then
   echo "SLURM_ARRAY_TASK_ID=${SLURM_ARRAY_TASK_ID} out of range for ${TOTAL_TASKS} tasks" >&2

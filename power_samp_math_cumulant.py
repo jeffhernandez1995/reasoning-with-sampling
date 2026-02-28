@@ -113,6 +113,11 @@ if __name__ == "__main__":
 
     parser.add_argument("--moment_rollouts", type=int, default=1)
     parser.add_argument("--cumulant_order", type=int, default=2)
+    parser.add_argument("--zeta_weight", type=float, default=1.0)
+    parser.add_argument("--varentropy_coef", type=float, default=1.0)
+    parser.add_argument("--length_normalize_logp", type=parse_bool, default=False)
+    parser.add_argument("--length_penalty", type=float, default=1.0)
+    parser.add_argument("--rollout_stop_on_eos", type=parse_bool, default=True)
 
     parser.add_argument("--rollout_temperature", type=float, default=1.0)
     parser.add_argument("--rollout_top_p", type=float, default=1.0)
@@ -153,6 +158,11 @@ if __name__ == "__main__":
         "block_size": args.block_size,
         "moment_rollouts": args.moment_rollouts,
         "cumulant_order": args.cumulant_order,
+        "zeta_weight": args.zeta_weight,
+        "varentropy_coef": args.varentropy_coef,
+        "length_normalize_logp": args.length_normalize_logp,
+        "length_penalty": args.length_penalty,
+        "rollout_stop_on_eos": args.rollout_stop_on_eos,
         "rollout_temperature": args.rollout_temperature,
         "rollout_top_p": args.rollout_top_p,
         "rollout_top_k": args.rollout_top_k,

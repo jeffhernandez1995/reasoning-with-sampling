@@ -83,12 +83,66 @@ def format_cuda_snapshot(snapshot: Dict[str, float]) -> str:
 
 
 def default_wandb_run_name(args) -> str:
+    rollout_tag = (
+        f"mr{args.moment_rollouts}"
+        if args.sampling_method == "power_cumulant"
+        else f"m{args.rollouts_per_candidate}"
+    )
     return (
         f"{args.dataset.lower()}_{args.model}_{args.sampling_method}"
         f"_t{_float_token(args.temperature)}_k{args.top_k}"
-        f"_m{args.rollouts_per_candidate}_b{args.block_size}"
+        f"_{rollout_tag}_b{args.block_size}"
         f"_shard{args.batch_idx:02d}_seed{args.seed:02d}"
     )
+
+
+def build_method_config(args, eos_token_id: Optional[int]) -> Dict[str, Any]:
+    method_config: Dict[str, Any] = {
+        "top_k": args.top_k,
+        "candidate_pool_size": args.candidate_pool_size,
+        "lookahead_tokens": args.lookahead_tokens,
+        "block_size": args.block_size,
+        "seed": args.seed,
+        "eos_token_id": eos_token_id,
+    }
+    if args.sampling_method == "power_approx":
+        method_config.update(
+            {
+                "rollouts_per_candidate": args.rollouts_per_candidate,
+                "use_jackknife": args.use_jackknife,
+            }
+        )
+    elif args.sampling_method == "power_cumulant":
+        method_config.update(
+            {
+                "moment_rollouts": args.moment_rollouts,
+                "cumulant_order": args.cumulant_order,
+                "zeta_weight": args.zeta_weight,
+                "varentropy_coef": args.varentropy_coef,
+                "length_normalize_logp": args.length_normalize_logp,
+                "length_penalty": args.length_penalty,
+                "rollout_stop_on_eos": args.rollout_stop_on_eos,
+                "rollout_temperature": args.rollout_temperature,
+                "rollout_top_p": args.rollout_top_p,
+                "rollout_top_k": args.rollout_top_k,
+            }
+        )
+    elif args.sampling_method == "power_tilted_cgf":
+        method_config.update(
+            {
+                "rollouts_per_candidate": args.rollouts_per_candidate,
+                "proposal_temperature": args.proposal_temperature,
+                "proposal_top_p": args.proposal_top_p,
+                "proposal_top_k": args.proposal_top_k,
+                "zeta_weight": args.zeta_weight,
+                "length_normalize_logp": args.length_normalize_logp,
+                "length_penalty": args.length_penalty,
+                "rollout_stop_on_eos": args.rollout_stop_on_eos,
+            }
+        )
+    else:
+        raise ValueError(f"Unsupported sampling_method: {args.sampling_method}")
+    return method_config
 
 
 if __name__ == "__main__":
@@ -103,7 +157,12 @@ if __name__ == "__main__":
     parser.add_argument("--temperature", "--temp", dest="temperature", type=float, default=0.25)
     parser.add_argument("--dataset", type=str, default="MATH")
     parser.add_argument("--cot", type=parse_bool, default=True)
-    parser.add_argument("--sampling_method", type=str, default="power_approx", choices=["power_approx"])
+    parser.add_argument(
+        "--sampling_method",
+        type=str,
+        default="power_approx",
+        choices=["power_approx", "power_cumulant", "power_tilted_cgf"],
+    )
     parser.add_argument("--max_new_tokens", type=int, default=3072)
     parser.add_argument("--top_k", type=int, default=8)
     parser.add_argument("--candidate_pool_size", type=int, default=32)
@@ -111,6 +170,19 @@ if __name__ == "__main__":
     parser.add_argument("--lookahead_tokens", type=int, default=192)
     parser.add_argument("--block_size", type=int, default=192)
     parser.add_argument("--use_jackknife", type=parse_bool, default=True)
+    parser.add_argument("--moment_rollouts", type=int, default=1)
+    parser.add_argument("--cumulant_order", type=int, default=2)
+    parser.add_argument("--zeta_weight", type=float, default=1.0)
+    parser.add_argument("--varentropy_coef", type=float, default=1.0)
+    parser.add_argument("--length_normalize_logp", type=parse_bool, default=False)
+    parser.add_argument("--length_penalty", type=float, default=1.0)
+    parser.add_argument("--rollout_stop_on_eos", type=parse_bool, default=True)
+    parser.add_argument("--rollout_temperature", type=float, default=1.0)
+    parser.add_argument("--rollout_top_p", type=float, default=1.0)
+    parser.add_argument("--rollout_top_k", type=int, default=None)
+    parser.add_argument("--proposal_temperature", type=float, default=None)
+    parser.add_argument("--proposal_top_p", type=float, default=1.0)
+    parser.add_argument("--proposal_top_k", type=int, default=None)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--batch_idx", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
@@ -139,16 +211,7 @@ if __name__ == "__main__":
     model, tokenizer = load_model_and_tokenizer(args.model, args.device, trust_remote_code=True)
     sampler = GenericSampler(model, tokenizer, args.device)
 
-    approx_method_config: Dict[str, Any] = {
-        "top_k": args.top_k,
-        "candidate_pool_size": args.candidate_pool_size,
-        "rollouts_per_candidate": args.rollouts_per_candidate,
-        "lookahead_tokens": args.lookahead_tokens,
-        "block_size": args.block_size,
-        "use_jackknife": args.use_jackknife,
-        "seed": args.seed,
-        "eos_token_id": tokenizer.eos_token_id,
-    }
+    method_config = build_method_config(args, tokenizer.eos_token_id)
 
     wandb_logger = WandbSampleLogger(
         project=args.wandb_project,
@@ -163,12 +226,7 @@ if __name__ == "__main__":
             "batch_idx": args.batch_idx,
             "seed": args.seed,
             "max_new_tokens": args.max_new_tokens,
-            "top_k": args.top_k,
-            "candidate_pool_size": args.candidate_pool_size,
-            "rollouts_per_candidate": args.rollouts_per_candidate,
-            "lookahead_tokens": args.lookahead_tokens,
-            "block_size": args.block_size,
-            "use_jackknife": args.use_jackknife,
+            **{k: v for k, v in method_config.items() if k not in {"eos_token_id"}},
             "wandb_run_name": wandb_run_name,
         },
     )
@@ -188,7 +246,7 @@ if __name__ == "__main__":
     output_path = os.path.join(
         save_str,
         (
-            f"{args.model}_math_base_power_approx_results_"
+            f"{args.model}_math_base_{args.sampling_method}_results_"
             f"k{args.top_k}_m{args.rollouts_per_candidate}_"
             f"b{args.block_size}_{args.temperature}_{args.batch_idx}_{args.seed}.csv"
         ),
@@ -197,7 +255,7 @@ if __name__ == "__main__":
 
     print(
         (
-            f"Starting MATH(power_approx): batch_idx={args.batch_idx} seed={args.seed} "
+            f"Starting MATH({args.sampling_method}): batch_idx={args.batch_idx} seed={args.seed} "
             f"questions={total_questions} device={args.device} save_every={args.save_every}"
         ),
         flush=True,
@@ -273,14 +331,14 @@ if __name__ == "__main__":
                 temperature=args.temperature,
                 mcmc_steps=0,
                 max_new_tokens=args.max_new_tokens,
-                method_config=approx_method_config,
+                method_config=method_config,
             )
             if args.cuda_sync and torch.cuda.is_available():
                 torch.cuda.synchronize()
             if args.debug_verbose:
                 print(
                     (
-                        f"[step {step_idx + 1}] power_approx latency={method_sample.latency_seconds:.2f}s "
+                        f"[step {step_idx + 1}] {args.sampling_method} latency={method_sample.latency_seconds:.2f}s "
                         f"tokens={len(method_sample.token_ids)}"
                     ),
                     flush=True,
@@ -308,12 +366,20 @@ if __name__ == "__main__":
             avg_approx_seconds = total_approx_seconds / max(total_approx_samples, 1)
 
             approx_rollouts = method_sample.metadata.get("rollouts")
+            if approx_rollouts is None:
+                approx_rollouts = method_sample.metadata.get("moment_rollouts")
             approx_rollout_tokens = method_sample.metadata.get("rollout_tokens")
             approx_steps = method_sample.metadata.get("steps")
             approx_candidate_tokens = method_sample.metadata.get("candidate_tokens")
             approx_sampling_tokens = method_sample.metadata.get("sampling_tokens")
             approx_output_tokens = method_sample.metadata.get("output_tokens")
             approx_internal_sampling_tokens = method_sample.metadata.get("internal_sampling_tokens")
+            method_specific_config = (
+                method_sample.metadata.get("approx_config")
+                or method_sample.metadata.get("cumulant_config")
+                or method_sample.metadata.get("tilted_cgf_config")
+                or {}
+            )
 
             results.append(
                 {
@@ -347,7 +413,7 @@ if __name__ == "__main__":
                     "approx_sampling_tokens": approx_sampling_tokens,
                     "approx_output_tokens": approx_output_tokens,
                     "approx_internal_sampling_tokens": approx_internal_sampling_tokens,
-                    "approx_config": json.dumps(method_sample.metadata.get("approx_config", {})),
+                    "approx_config": json.dumps(method_specific_config),
                     "naive_reward": naive_reward,
                     "std_reward": std_reward,
                     "mcmc_reward": method_reward,
@@ -443,7 +509,7 @@ if __name__ == "__main__":
     print(f"Saved results to: {output_path}")
     print(f"Average base sampling time per sample: {avg_base_seconds:.4f} seconds")
     print(f"Average temp sampling time per sample: {avg_temp_seconds:.4f} seconds")
-    print(f"Average power_approx sampling time per sample: {avg_approx_seconds:.4f} seconds")
+    print(f"Average {args.sampling_method} sampling time per sample: {avg_approx_seconds:.4f} seconds")
 
     wandb_logger.finish(
         summary={
