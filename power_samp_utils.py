@@ -22,7 +22,7 @@ from torch.nn import functional as F
 import transformers
 
 from grader_utils.parse_utils import parse_answer
-from constants import *
+from constants import PROMPT, COT, BASE
 
 ### DESCRIPTION ###
 # power sampling to sample from p^{alpha}, where p is the base model
@@ -252,55 +252,55 @@ def mcmc_power_samp(p : AutoregressiveSampler, context, temp, mcmc_steps, max_ne
     return gen, log_probs_norm, log_probs_unnorm, acceptance_ratio
 
 
-def format_prompt(question, model, tokenizer, cot=True):
-    if model == "qwen":
-        format_str = PROMPT + question
-        if cot:
-            format_str+=COT
-        else:
-            format_str+=BASE
+def _apply_chat_template_safe(tokenizer, answer_context, enable_thinking=None):
+    template_kwargs = {
+        "tokenize": False,
+        "add_generation_prompt": True,
+    }
+    if enable_thinking is None:
+        return tokenizer.apply_chat_template(answer_context, **template_kwargs)
+    try:
+        return tokenizer.apply_chat_template(
+            answer_context,
+            enable_thinking=enable_thinking,
+            **template_kwargs,
+        )
+    except TypeError:
+        # Older tokenizers may not support enable_thinking.
+        return tokenizer.apply_chat_template(answer_context, **template_kwargs)
 
-    elif model == "qwen_math":
-        format_str = PROMPT + question
-        if cot:
-            format_str+=COT
-        else:
-            format_str+=BASE
 
-    elif model == "qwen_math_grpo":
-        content_str = PROMPT + question
-        if cot:
-            content_str+=COT
-        else:
-            content_str+=BASE
-        answer_context = [{"role": "user", "content": content_str}]
-        format_str = tokenizer.apply_chat_template(answer_context, tokenize=False, add_generation_prompt=True)
+def format_prompt(question, model, tokenizer, cot=True, enable_thinking=None):
+    prompt_body = PROMPT + question
+    prompt_with_style = prompt_body + (COT if cot else BASE)
 
-    elif model == "phi_grpo":
-        content_str = PROMPT + question
-        if cot:
-            content_str+=COT
-        else:
-            content_str+=BASE
-        answer_context = [{"role": "user", "content": content_str}]
-        format_str = tokenizer.apply_chat_template(answer_context, tokenize=False, add_generation_prompt=True)
+    plain_models = {"qwen", "qwen_math"}
+    chat_models = {"qwen_math_grpo", "phi_grpo", "phi", "tulu"}
 
-    elif model == "phi":
-        content_str = PROMPT + question
-        if cot:
-            content_str+=COT
-        else:
-            content_str+=BASE
-        answer_context = [{"role": "user", "content": content_str}]
-        format_str = tokenizer.apply_chat_template(answer_context, tokenize=False, add_generation_prompt=True)
+    if model in plain_models:
+        if enable_thinking:
+            answer_context = [{"role": "user", "content": prompt_with_style}]
+            return _apply_chat_template_safe(
+                tokenizer,
+                answer_context,
+                enable_thinking=enable_thinking,
+            )
+        return prompt_with_style
 
-    elif model == "tulu":
-        content_str = PROMPT + question
-        if cot:
-            content_str+=COT
-        else:
-            content_str+=BASE
-        answer_context = [{"role": "user", "content": content_str}]
-        format_str = tokenizer.apply_chat_template(answer_context, tokenize=False, add_generation_prompt=True)
+    if model in chat_models:
+        answer_context = [{"role": "user", "content": prompt_with_style}]
+        return _apply_chat_template_safe(
+            tokenizer,
+            answer_context,
+            enable_thinking=enable_thinking,
+        )
 
-    return format_str
+    if enable_thinking:
+        answer_context = [{"role": "user", "content": prompt_with_style}]
+        return _apply_chat_template_safe(
+            tokenizer,
+            answer_context,
+            enable_thinking=enable_thinking,
+        )
+
+    return prompt_with_style

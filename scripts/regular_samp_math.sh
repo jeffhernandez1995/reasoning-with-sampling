@@ -53,18 +53,19 @@ fi
 cd "${REPO_ROOT}"
 mkdir -p "/scratch/$USER/logs" "${HF_HOME}"
 
-# Force run config in-script to avoid inheriting submit-shell overrides.
-HF_MODEL_ID="stellalisy/rethink_rlvr_reproduce-ground_truth-qwen2.5_math_7b-lr5e-7-kl0.00-step150"
-TEMP="0.25"
-MAX_NEW_TOKENS="3072"
-SAVE_STR="/scratch/$USER/reasoning-with-sampling/results"
+# Run config (override via environment when calling sbatch).
+HF_MODEL_ID="${HF_MODEL_ID:-stellalisy/rethink_rlvr_reproduce-ground_truth-qwen2.5_math_7b-lr5e-7-kl0.00-step150}"
+TEMP="${TEMP:-0.25}"
+MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-3072}"
+ENABLE_THINKING="${ENABLE_THINKING:-auto}"
+SAVE_STR="${SAVE_STR:-/scratch/$USER/reasoning-with-sampling/results}"
 mkdir -p "${SAVE_STR}"
 
 echo "== Node =="
 hostname
 echo "SLURM_JOB_ID=${SLURM_JOB_ID} ARRAY_TASK=${SLURM_ARRAY_TASK_ID}"
 echo "BATCH_IDX=${BATCH_IDX} SEED=${SEED}"
-echo "HF_MODEL_ID=${HF_MODEL_ID} TEMP=${TEMP} MAX_NEW_TOKENS=${MAX_NEW_TOKENS}"
+echo "HF_MODEL_ID=${HF_MODEL_ID} TEMP=${TEMP} MAX_NEW_TOKENS=${MAX_NEW_TOKENS} ENABLE_THINKING=${ENABLE_THINKING}"
 echo "REPO_ROOT=${REPO_ROOT}"
 echo "SAVE_STR=${SAVE_STR}"
 echo
@@ -89,5 +90,6 @@ python \"${REPO_ROOT}/regular_samp_math.py\" \
   --max_new_tokens \"${MAX_NEW_TOKENS}\" \
   --seed \"${SEED}\" \
   --hf_model_id \"${HF_MODEL_ID}\" \
+  --enable_thinking \"${ENABLE_THINKING}\" \
   --save_str \"${SAVE_STR}\"
 "
