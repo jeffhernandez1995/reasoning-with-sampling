@@ -55,10 +55,36 @@ mkdir -p "/scratch/$USER/logs" "${HF_HOME}"
 
 # Run config (override via environment when calling sbatch).
 HF_MODEL_ID="${HF_MODEL_ID:-stellalisy/rethink_rlvr_reproduce-ground_truth-qwen2.5_math_7b-lr5e-7-kl0.00-step150}"
-TEMP="${TEMP:-0.25}"
-MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-3072}"
 ENABLE_THINKING="${ENABLE_THINKING:-auto}"
+PY_VENV_PATH="${PY_VENV_PATH:-/scratch/$USER/venvs/psamp-qwen3}"
 SAVE_STR="${SAVE_STR:-/scratch/$USER/reasoning-with-sampling/results}"
+
+if [[ "${HF_MODEL_ID}" == Qwen/Qwen3-* ]]; then
+  TEMP="${TEMP:-0.6}"
+  STANDARD_TEMPERATURE="${STANDARD_TEMPERATURE:-0.6}"
+  TOP_P="${TOP_P:-0.95}"
+  TOP_K="${TOP_K:-20}"
+  MIN_P="${MIN_P:-0.0}"
+  MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-32768}"
+  THINKING_CONTROL_MODE="${THINKING_CONTROL_MODE:-multi_pass}"
+else
+  TEMP="${TEMP:-0.25}"
+  STANDARD_TEMPERATURE="${STANDARD_TEMPERATURE:-none}"
+  TOP_P="${TOP_P:-none}"
+  TOP_K="${TOP_K:-none}"
+  MIN_P="${MIN_P:-none}"
+  MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-3072}"
+  THINKING_CONTROL_MODE="${THINKING_CONTROL_MODE:-none}"
+fi
+
+THINKING_ANSWER_BUDGET_TOKENS="${THINKING_ANSWER_BUDGET_TOKENS:-900}"
+MAX_THINKING_TOKENS="${MAX_THINKING_TOKENS:-none}"
+MIN_THINKING_TOKENS="${MIN_THINKING_TOKENS:-0}"
+IGNORE_EOT_ATTEMPTS="${IGNORE_EOT_ATTEMPTS:-0}"
+EOT_TRIGGER_TOPK="${EOT_TRIGGER_TOPK:-1}"
+WAIT_TEXT="${WAIT_TEXT:-\\nWait\\n}"
+EARLY_STOPPING_TEXT="${EARLY_STOPPING_TEXT:-\\n\\nConsidering the limited time by the user, I have to give the solution based on the thinking directly now.\\n</think>\\n\\n}"
+THINKING_EXTRA_TOKENS="${THINKING_EXTRA_TOKENS:-0}"
 mkdir -p "${SAVE_STR}"
 
 echo "== Node =="
@@ -66,6 +92,11 @@ hostname
 echo "SLURM_JOB_ID=${SLURM_JOB_ID} ARRAY_TASK=${SLURM_ARRAY_TASK_ID}"
 echo "BATCH_IDX=${BATCH_IDX} SEED=${SEED}"
 echo "HF_MODEL_ID=${HF_MODEL_ID} TEMP=${TEMP} MAX_NEW_TOKENS=${MAX_NEW_TOKENS} ENABLE_THINKING=${ENABLE_THINKING}"
+echo "STANDARD_TEMPERATURE=${STANDARD_TEMPERATURE} TOP_P=${TOP_P} TOP_K=${TOP_K} MIN_P=${MIN_P}"
+echo "THINKING_CONTROL_MODE=${THINKING_CONTROL_MODE} THINKING_ANSWER_BUDGET_TOKENS=${THINKING_ANSWER_BUDGET_TOKENS}"
+echo "MAX_THINKING_TOKENS=${MAX_THINKING_TOKENS} MIN_THINKING_TOKENS=${MIN_THINKING_TOKENS} IGNORE_EOT_ATTEMPTS=${IGNORE_EOT_ATTEMPTS}"
+echo "EOT_TRIGGER_TOPK=${EOT_TRIGGER_TOPK} THINKING_EXTRA_TOKENS=${THINKING_EXTRA_TOKENS}"
+echo "PY_VENV_PATH=${PY_VENV_PATH}"
 echo "REPO_ROOT=${REPO_ROOT}"
 echo "SAVE_STR=${SAVE_STR}"
 echo
@@ -73,6 +104,11 @@ echo
 srun --ntasks=1 bash -lc "
 source \"$HOME/miniconda3/etc/profile.d/conda.sh\" &&
 conda activate psamp &&
+if [[ ! -f \"${PY_VENV_PATH}/bin/activate\" ]]; then
+  echo \"Missing overlay env at ${PY_VENV_PATH}. Expected ${PY_VENV_PATH}/bin/activate\" >&2 &&
+  exit 1;
+fi &&
+source \"${PY_VENV_PATH}/bin/activate\" &&
 unset LD_PRELOAD &&
 if [[ -n \"\${LD_LIBRARY_PATH:-}\" ]]; then
   CLEAN_LD_LIBRARY_PATH=\$(printf '%s' \"\$LD_LIBRARY_PATH\" | tr ':' '\n' | grep -v '^/opt/apps/xalt/default/lib64$' | paste -sd: -);
@@ -88,8 +124,21 @@ python \"${REPO_ROOT}/regular_samp_math.py\" \
   --batch_idx \"${BATCH_IDX}\" \
   --temp \"${TEMP}\" \
   --max_new_tokens \"${MAX_NEW_TOKENS}\" \
+  --standard_temperature \"${STANDARD_TEMPERATURE}\" \
+  --top_p \"${TOP_P}\" \
+  --top_k \"${TOP_K}\" \
+  --min_p \"${MIN_P}\" \
   --seed \"${SEED}\" \
   --hf_model_id \"${HF_MODEL_ID}\" \
   --enable_thinking \"${ENABLE_THINKING}\" \
+  --thinking_control_mode \"${THINKING_CONTROL_MODE}\" \
+  --thinking_answer_budget_tokens \"${THINKING_ANSWER_BUDGET_TOKENS}\" \
+  --max_thinking_tokens \"${MAX_THINKING_TOKENS}\" \
+  --min_thinking_tokens \"${MIN_THINKING_TOKENS}\" \
+  --ignore_eot_attempts \"${IGNORE_EOT_ATTEMPTS}\" \
+  --eot_trigger_topk \"${EOT_TRIGGER_TOPK}\" \
+  --wait_text \"${WAIT_TEXT}\" \
+  --early_stopping_text \"${EARLY_STOPPING_TEXT}\" \
+  --thinking_extra_tokens \"${THINKING_EXTRA_TOKENS}\" \
   --save_str \"${SAVE_STR}\"
 "

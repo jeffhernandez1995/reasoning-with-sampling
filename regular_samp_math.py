@@ -14,7 +14,8 @@ from tqdm import tqdm
 from grader_utils.math_grader import grade_answer
 from grader_utils.parse_utils import parse_answer
 from power_samp_utils import format_prompt
-from sampling_runtime import GenericSampler, WandbSampleLogger
+from sampling_runtime import GenericSampler, SamplingOutput, WandbSampleLogger
+from thinking_control import DEFAULT_EARLY_STOPPING_TEXT, ThinkingControlConfig, generate_with_thinking_control
 
 
 QWEN3_END_THINK_TOKEN_ID = 151668
@@ -37,6 +38,24 @@ def parse_auto_bool(value: Any) -> Optional[bool]:
     if normalized in {"0", "false", "f", "no", "n", "off"}:
         return False
     raise ValueError(f"Invalid boolean/auto value: {value}")
+
+
+def parse_optional_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    if normalized in {"", "none", "null"}:
+        return None
+    return float(value)
+
+
+def parse_optional_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    if normalized in {"", "none", "null"}:
+        return None
+    return int(value)
 
 
 def truncate_text(text: str, max_chars: int = 1200) -> str:
@@ -71,6 +90,37 @@ def resolve_enable_thinking(enable_thinking_arg: Optional[bool], model_id: str) 
     if enable_thinking_arg is not None:
         return bool(enable_thinking_arg)
     return is_qwen_thinking_model(model_id)
+
+
+def resolve_thinking_control_mode(mode_arg: str, enable_thinking: bool, model_id: str) -> str:
+    normalized = str(mode_arg).strip().lower()
+    valid_modes = {"none", "multi_pass", "logits"}
+    if normalized in valid_modes:
+        return normalized
+    if normalized in {"auto", "default"}:
+        if enable_thinking and is_qwen_thinking_model(model_id):
+            return "multi_pass"
+        return "none"
+    raise ValueError(f"Invalid thinking_control_mode: {mode_arg}")
+
+
+def _build_generation_kwargs(
+    *,
+    top_p: Optional[float],
+    top_k: Optional[int],
+    min_p: Optional[float],
+    temperature_override: Optional[float] = None,
+) -> Dict[str, Any]:
+    generation_kwargs: Dict[str, Any] = {}
+    if temperature_override is not None:
+        generation_kwargs["temperature"] = float(temperature_override)
+    if top_p is not None:
+        generation_kwargs["top_p"] = float(top_p)
+    if top_k is not None:
+        generation_kwargs["top_k"] = int(top_k)
+    if min_p is not None:
+        generation_kwargs["min_p"] = float(min_p)
+    return generation_kwargs
 
 
 def load_hf_model_and_tokenizer(
@@ -160,6 +210,68 @@ def split_thinking_and_answer(
     }
 
 
+def run_sampling(
+    *,
+    sampler: GenericSampler,
+    model,
+    tokenizer,
+    input_ids,
+    mode_label: str,
+    max_new_tokens: int,
+    temperature: Optional[float],
+    generation_kwargs: Optional[Dict[str, Any]],
+    thinking_control_cfg: Optional[ThinkingControlConfig],
+    end_think_token_id: Optional[int],
+) -> SamplingOutput:
+    if thinking_control_cfg is None:
+        if mode_label == "standard":
+            return sampler.sample_standard(
+                input_ids=input_ids,
+                max_new_tokens=max_new_tokens,
+                generation_kwargs=generation_kwargs,
+            )
+        if mode_label == "temperature":
+            if temperature is None:
+                raise ValueError("temperature must be set for temperature sampling.")
+            return sampler.sample_temperature(
+                input_ids=input_ids,
+                temperature=float(temperature),
+                max_new_tokens=max_new_tokens,
+                generation_kwargs=generation_kwargs,
+            )
+        raise ValueError(f"Unsupported mode_label: {mode_label}")
+
+    if mode_label == "temperature" and temperature is not None:
+        effective_generation_kwargs = dict(generation_kwargs or {})
+        effective_generation_kwargs["temperature"] = float(temperature)
+    else:
+        effective_generation_kwargs = dict(generation_kwargs or {})
+    effective_generation_kwargs.setdefault("do_sample", True)
+    effective_generation_kwargs.setdefault("return_dict_in_generate", False)
+    effective_generation_kwargs.setdefault("output_scores", False)
+    pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    if pad_token_id is not None:
+        effective_generation_kwargs.setdefault("pad_token_id", int(pad_token_id))
+
+    controlled = generate_with_thinking_control(
+        model=model,
+        tokenizer=tokenizer,
+        input_ids=input_ids,
+        max_new_tokens=max_new_tokens,
+        generation_kwargs=effective_generation_kwargs,
+        think_end_id=end_think_token_id,
+        control=thinking_control_cfg,
+    )
+    completion = tokenizer.decode(controlled.token_ids, skip_special_tokens=True)
+    return SamplingOutput(
+        method=mode_label,
+        completion=completion,
+        token_ids=controlled.token_ids,
+        latency_seconds=controlled.latency_seconds,
+        metadata=controlled.metadata,
+    )
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--save_str", type=str, default="results/")
@@ -172,6 +284,15 @@ if __name__ == "__main__":
     parser.add_argument("--dataset", type=str, default="MATH")
     parser.add_argument("--cot", type=parse_bool, default=True)
     parser.add_argument("--max_new_tokens", type=int, default=3072)
+    parser.add_argument("--top_p", type=parse_optional_float, default=None)
+    parser.add_argument("--top_k", type=parse_optional_int, default=None)
+    parser.add_argument("--min_p", type=parse_optional_float, default=None)
+    parser.add_argument(
+        "--standard_temperature",
+        type=parse_optional_float,
+        default=None,
+        help="Optional override temperature for standard sampling. If unset, model generation_config is used.",
+    )
     parser.add_argument("--sampling_method", type=str, default="regular", choices=["regular"])
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--batch_idx", type=int, default=0)
@@ -184,6 +305,36 @@ if __name__ == "__main__":
         default=None,
         help="auto/true/false. auto enables thinking mode for Qwen3-family model IDs.",
     )
+    parser.add_argument(
+        "--thinking_control_mode",
+        type=str,
+        default="auto",
+        choices=["auto", "none", "multi_pass", "logits"],
+        help="Budget forcing controller for thinking traces. auto => multi_pass for Qwen3 thinking models.",
+    )
+    parser.add_argument(
+        "--thinking_answer_budget_tokens",
+        type=int,
+        default=900,
+        help="Used to derive max_thinking_tokens=max_new_tokens-answer_budget when max_thinking_tokens is unset.",
+    )
+    parser.add_argument(
+        "--max_thinking_tokens",
+        type=parse_optional_int,
+        default=None,
+        help="Hard cap for thinking tokens before forcing early_stopping_text. Optional.",
+    )
+    parser.add_argument("--min_thinking_tokens", type=int, default=0)
+    parser.add_argument("--ignore_eot_attempts", type=int, default=0)
+    parser.add_argument("--eot_trigger_topk", type=int, default=1)
+    parser.add_argument("--wait_text", type=str, default="\\nWait\\n")
+    parser.add_argument("--early_stopping_text", type=str, default=DEFAULT_EARLY_STOPPING_TEXT)
+    parser.add_argument(
+        "--thinking_extra_tokens",
+        type=int,
+        default=0,
+        help="Optional extra decode headroom for forced text insertion.",
+    )
     parser.add_argument("--wandb_project", type=str, default=os.environ.get("WANDB_PROJECT", "reasoning-with-sampling"))
     parser.add_argument("--wandb_entity", type=str, default=os.environ.get("WANDB_ENTITY"))
     parser.add_argument("--wandb_run_name", type=str, default=os.environ.get("WANDB_RUN_NAME"))
@@ -192,6 +343,11 @@ if __name__ == "__main__":
 
     model_slug = _slugify_model_id(args.hf_model_id)
     enable_thinking = resolve_enable_thinking(args.enable_thinking, args.hf_model_id)
+    thinking_control_mode = resolve_thinking_control_mode(
+        args.thinking_control_mode,
+        enable_thinking=enable_thinking,
+        model_id=args.hf_model_id,
+    )
     wandb_run_name = args.wandb_run_name or default_wandb_run_name(args, model_slug)
 
     random.seed(args.seed)
@@ -218,10 +374,60 @@ if __name__ == "__main__":
     sampler = GenericSampler(model, tokenizer, args.device)
     end_think_token_id = resolve_end_think_token_id(tokenizer, args.hf_model_id, enable_thinking)
 
+    if thinking_control_mode != "none" and end_think_token_id is None:
+        print(
+            "Thinking control requested but </think> token could not be resolved. "
+            "Disabling thinking control for this run.",
+            flush=True,
+        )
+        thinking_control_mode = "none"
+
+    max_thinking_tokens = args.max_thinking_tokens
+    if max_thinking_tokens is None and thinking_control_mode != "none":
+        max_thinking_tokens = max(args.max_new_tokens - max(args.thinking_answer_budget_tokens, 0), 0)
+    if max_thinking_tokens is not None:
+        max_thinking_tokens = max(int(max_thinking_tokens), 0)
+
+    thinking_control_cfg: Optional[ThinkingControlConfig] = None
+    if thinking_control_mode != "none":
+        thinking_control_cfg = ThinkingControlConfig(
+            mode=thinking_control_mode,
+            max_thinking_tokens=max_thinking_tokens,
+            min_thinking_tokens=max(args.min_thinking_tokens, 0),
+            ignore_eot_attempts=max(args.ignore_eot_attempts, 0),
+            eot_trigger_topk=max(args.eot_trigger_topk, 1),
+            wait_text=args.wait_text.encode("utf-8").decode("unicode_escape"),
+            early_stopping_text=args.early_stopping_text.encode("utf-8").decode("unicode_escape"),
+            extra_generation_tokens=max(args.thinking_extra_tokens, 0),
+        )
+
+    standard_generation_kwargs = _build_generation_kwargs(
+        top_p=args.top_p,
+        top_k=args.top_k,
+        min_p=args.min_p,
+        temperature_override=args.standard_temperature,
+    )
+    temperature_generation_kwargs = _build_generation_kwargs(
+        top_p=args.top_p,
+        top_k=args.top_k,
+        min_p=args.min_p,
+        temperature_override=None,
+    )
+
     print(
         "Thinking-mode setup: "
         f"enable_thinking={enable_thinking} "
-        f"end_think_token_id={end_think_token_id}",
+        f"end_think_token_id={end_think_token_id} "
+        f"thinking_control_mode={thinking_control_mode} "
+        f"max_thinking_tokens={max_thinking_tokens}",
+        flush=True,
+    )
+    print(
+        "Generation setup: "
+        f"temperature={args.temperature} "
+        f"standard_temperature={args.standard_temperature} "
+        f"top_p={args.top_p} top_k={args.top_k} min_p={args.min_p} "
+        f"max_new_tokens={args.max_new_tokens}",
         flush=True,
     )
 
@@ -239,10 +445,23 @@ if __name__ == "__main__":
             "batch_idx": args.batch_idx,
             "seed": args.seed,
             "max_new_tokens": args.max_new_tokens,
+            "top_p": args.top_p,
+            "top_k": args.top_k,
+            "min_p": args.min_p,
+            "standard_temperature": args.standard_temperature,
             "trust_remote_code": args.trust_remote_code,
             "local_files_only": args.local_files_only,
             "enable_thinking": enable_thinking,
             "end_think_token_id": end_think_token_id,
+            "thinking_control_mode": thinking_control_mode,
+            "thinking_answer_budget_tokens": args.thinking_answer_budget_tokens,
+            "max_thinking_tokens": max_thinking_tokens,
+            "min_thinking_tokens": args.min_thinking_tokens,
+            "ignore_eot_attempts": args.ignore_eot_attempts,
+            "eot_trigger_topk": args.eot_trigger_topk,
+            "wait_text": args.wait_text,
+            "early_stopping_text": args.early_stopping_text,
+            "thinking_extra_tokens": args.thinking_extra_tokens,
             "wandb_run_name": wandb_run_name,
         },
     )
@@ -271,12 +490,30 @@ if __name__ == "__main__":
         )
         input_ids = tokenizer([input_text], return_tensors="pt")["input_ids"].to(args.device)
 
-        naive_sample = sampler.sample_temperature(
+        naive_sample = run_sampling(
+            sampler=sampler,
+            model=model,
+            tokenizer=tokenizer,
             input_ids=input_ids,
-            temperature=args.temperature,
+            mode_label="temperature",
             max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+            generation_kwargs=temperature_generation_kwargs,
+            thinking_control_cfg=thinking_control_cfg,
+            end_think_token_id=end_think_token_id,
         )
-        std_sample = sampler.sample_standard(input_ids=input_ids, max_new_tokens=args.max_new_tokens)
+        std_sample = run_sampling(
+            sampler=sampler,
+            model=model,
+            tokenizer=tokenizer,
+            input_ids=input_ids,
+            mode_label="standard",
+            max_new_tokens=args.max_new_tokens,
+            temperature=None,
+            generation_kwargs=standard_generation_kwargs,
+            thinking_control_cfg=thinking_control_cfg,
+            end_think_token_id=end_think_token_id,
+        )
 
         # "mcmc_*" columns are kept for downstream compatibility with eval_math/passk scripts.
         regular_sample = std_sample
@@ -303,6 +540,9 @@ if __name__ == "__main__":
         temp_output_tokens = len(naive_sample.token_ids)
         std_output_tokens = len(std_sample.token_ids)
         regular_output_tokens = len(regular_sample.token_ids)
+        naive_meta = dict(naive_sample.metadata or {})
+        std_meta = dict(std_sample.metadata or {})
+        regular_meta = dict(regular_sample.metadata or {})
 
         total_base_seconds += base_seconds
         total_temp_seconds += temp_seconds
@@ -324,6 +564,11 @@ if __name__ == "__main__":
                 "prompt_style": "qwen_math",
                 "enable_thinking": enable_thinking,
                 "end_think_token_id": end_think_token_id,
+                "thinking_control_mode": thinking_control_mode,
+                "max_thinking_tokens": max_thinking_tokens,
+                "min_thinking_tokens": args.min_thinking_tokens,
+                "ignore_eot_attempts": args.ignore_eot_attempts,
+                "eot_trigger_topk": args.eot_trigger_topk,
                 "naive_completion": naive_sample.completion,
                 "naive_answer": naive_answer,
                 "std_completion": std_sample.completion,
@@ -362,6 +607,27 @@ if __name__ == "__main__":
                 "std_reward": std_reward,
                 "regular_reward": regular_reward,
                 "mcmc_reward": regular_reward,
+                "naive_control_mode": naive_meta.get("thinking_control_mode"),
+                "naive_control_active": naive_meta.get("thinking_control_active"),
+                "naive_ignored_eot_count": naive_meta.get("thinking_ignored_eot_count", 0),
+                "naive_forced_wait_count": naive_meta.get("thinking_forced_wait_count", 0),
+                "naive_forced_early_stop_count": naive_meta.get("thinking_forced_early_stop_count", 0),
+                "naive_generation_limit_tokens": naive_meta.get("thinking_generation_limit_tokens"),
+                "naive_reached_generation_limit": naive_meta.get("thinking_reached_generation_limit"),
+                "std_control_mode": std_meta.get("thinking_control_mode"),
+                "std_control_active": std_meta.get("thinking_control_active"),
+                "std_ignored_eot_count": std_meta.get("thinking_ignored_eot_count", 0),
+                "std_forced_wait_count": std_meta.get("thinking_forced_wait_count", 0),
+                "std_forced_early_stop_count": std_meta.get("thinking_forced_early_stop_count", 0),
+                "std_generation_limit_tokens": std_meta.get("thinking_generation_limit_tokens"),
+                "std_reached_generation_limit": std_meta.get("thinking_reached_generation_limit"),
+                "regular_control_mode": regular_meta.get("thinking_control_mode"),
+                "regular_control_active": regular_meta.get("thinking_control_active"),
+                "regular_ignored_eot_count": regular_meta.get("thinking_ignored_eot_count", 0),
+                "regular_forced_wait_count": regular_meta.get("thinking_forced_wait_count", 0),
+                "regular_forced_early_stop_count": regular_meta.get("thinking_forced_early_stop_count", 0),
+                "regular_generation_limit_tokens": regular_meta.get("thinking_generation_limit_tokens"),
+                "regular_reached_generation_limit": regular_meta.get("thinking_reached_generation_limit"),
             }
         )
 
@@ -388,6 +654,9 @@ if __name__ == "__main__":
                 "sampling/regular_answer_tokens": regular_split["answer_token_count"],
                 "sampling/regular_avg_thinking_tokens": avg_regular_thinking_tokens,
                 "sampling/regular_avg_answer_tokens": avg_regular_answer_tokens,
+                "sampling/regular_ignored_eot_count": regular_meta.get("thinking_ignored_eot_count", 0),
+                "sampling/regular_forced_wait_count": regular_meta.get("thinking_forced_wait_count", 0),
+                "sampling/regular_forced_early_stop_count": regular_meta.get("thinking_forced_early_stop_count", 0),
             },
             step=step_idx,
         )
@@ -414,6 +683,10 @@ if __name__ == "__main__":
                 "std_answer_tokens": std_split["answer_token_count"],
                 "regular_thinking_tokens": regular_split["thinking_token_count"],
                 "regular_answer_tokens": regular_split["answer_token_count"],
+                "regular_control_mode": regular_meta.get("thinking_control_mode"),
+                "regular_ignored_eot_count": regular_meta.get("thinking_ignored_eot_count", 0),
+                "regular_forced_wait_count": regular_meta.get("thinking_forced_wait_count", 0),
+                "regular_forced_early_stop_count": regular_meta.get("thinking_forced_early_stop_count", 0),
             }
         )
 

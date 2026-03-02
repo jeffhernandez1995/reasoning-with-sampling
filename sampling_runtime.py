@@ -607,19 +607,26 @@ class GenericSampler:
         return sorted(self._method_registry.keys())
 
     @torch.inference_mode()
-    def sample_standard(self, input_ids, max_new_tokens: int = 3072) -> SamplingOutput:
+    def sample_standard(
+        self,
+        input_ids,
+        max_new_tokens: int = 3072,
+        generation_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> SamplingOutput:
         prompt_len = input_ids.shape[1]
         attention_mask = torch.ones_like(input_ids)
         start = perf_counter()
-        output = self.model.generate(
-            input_ids,
-            attention_mask=attention_mask,
-            max_new_tokens=max_new_tokens,
-            return_dict_in_generate=False,
-            output_scores=False,
-            do_sample=True,
-            pad_token_id=self._pad_token_id,
-        )
+        call_kwargs = {
+            "attention_mask": attention_mask,
+            "max_new_tokens": max_new_tokens,
+            "return_dict_in_generate": False,
+            "output_scores": False,
+            "do_sample": True,
+            "pad_token_id": self._pad_token_id,
+        }
+        if generation_kwargs:
+            call_kwargs.update(generation_kwargs)
+        output = self.model.generate(input_ids, **call_kwargs)
         latency_seconds = perf_counter() - start
         generated_ids = output[0][prompt_len:].detach().cpu().tolist()
         completion = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
@@ -631,20 +638,28 @@ class GenericSampler:
         )
 
     @torch.inference_mode()
-    def sample_temperature(self, input_ids, temperature: float, max_new_tokens: int = 3072) -> SamplingOutput:
+    def sample_temperature(
+        self,
+        input_ids,
+        temperature: float,
+        max_new_tokens: int = 3072,
+        generation_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> SamplingOutput:
         prompt_len = input_ids.shape[1]
         attention_mask = torch.ones_like(input_ids)
         start = perf_counter()
-        output = self.model.generate(
-            input_ids,
-            attention_mask=attention_mask,
-            max_new_tokens=max_new_tokens,
-            return_dict_in_generate=False,
-            output_scores=False,
-            do_sample=True,
-            temperature=temperature,
-            pad_token_id=self._pad_token_id,
-        )
+        call_kwargs = {
+            "attention_mask": attention_mask,
+            "max_new_tokens": max_new_tokens,
+            "return_dict_in_generate": False,
+            "output_scores": False,
+            "do_sample": True,
+            "temperature": temperature,
+            "pad_token_id": self._pad_token_id,
+        }
+        if generation_kwargs:
+            call_kwargs.update(generation_kwargs)
+        output = self.model.generate(input_ids, **call_kwargs)
         latency_seconds = perf_counter() - start
         generated_ids = output[0][prompt_len:].detach().cpu().tolist()
         completion = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
