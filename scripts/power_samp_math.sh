@@ -57,6 +57,8 @@ mkdir -p "/scratch/$USER/logs" "${HF_HOME}"
 MODEL="qwen_math"
 MCMC_STEPS="10"
 MCMC_STOP_MODE="budget"
+MCMC_BUDGET_STRATEGY="restart"
+MCMC_SELECTION_MODE="weighted_vote"
 TEMP="0.25"
 MAX_SAMPLING_TOKENS="1024"
 SAVE_STR="/scratch/$USER/reasoning-with-sampling/results"
@@ -67,6 +69,7 @@ hostname
 echo "SLURM_JOB_ID=${SLURM_JOB_ID} ARRAY_TASK=${SLURM_ARRAY_TASK_ID}"
 echo "BATCH_IDX=${BATCH_IDX} SEED=${SEED}"
 echo "MODEL=${MODEL} MCMC_STEPS=${MCMC_STEPS} MCMC_STOP_MODE=${MCMC_STOP_MODE} TEMP=${TEMP}"
+echo "MCMC_BUDGET_STRATEGY=${MCMC_BUDGET_STRATEGY} MCMC_SELECTION_MODE=${MCMC_SELECTION_MODE}"
 echo "MAX_SAMPLING_TOKENS=${MAX_SAMPLING_TOKENS:-unset}"
 echo "REPO_ROOT=${REPO_ROOT}"
 echo "SAVE_STR=${SAVE_STR}"
@@ -77,6 +80,8 @@ if [[ -n "${MAX_SAMPLING_TOKENS}" ]]; then
   printf -v EXTRA_ARG_STR '%s --max_sampling_tokens %q' "${EXTRA_ARG_STR}" "${MAX_SAMPLING_TOKENS}"
 fi
 printf -v EXTRA_ARG_STR '%s --mcmc_stop_mode %q' "${EXTRA_ARG_STR}" "${MCMC_STOP_MODE}"
+printf -v EXTRA_ARG_STR '%s --mcmc_budget_strategy %q' "${EXTRA_ARG_STR}" "${MCMC_BUDGET_STRATEGY}"
+printf -v EXTRA_ARG_STR '%s --mcmc_selection_mode %q' "${EXTRA_ARG_STR}" "${MCMC_SELECTION_MODE}"
 
 srun --ntasks=1 bash -lc "
 source \"$HOME/miniconda3/etc/profile.d/conda.sh\" &&

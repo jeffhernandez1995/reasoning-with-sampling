@@ -41,10 +41,15 @@ def default_wandb_run_name(args) -> str:
     budget_suffix = "" if args.max_sampling_tokens is None else f"_budget{args.max_sampling_tokens}"
     block_suffix = "" if args.mcmc_block_num == 16 else f"_b{args.mcmc_block_num}"
     stop_suffix = "" if args.mcmc_stop_mode == "eos" else f"_stop{args.mcmc_stop_mode}"
+    strategy_suffix = ""
+    if args.mcmc_stop_mode == "budget":
+        strategy_suffix = f"_{args.mcmc_budget_strategy}"
+        if args.mcmc_budget_strategy == "restart":
+            strategy_suffix += f"_{args.mcmc_selection_mode}"
     return (
         f"{args.dataset.lower()}_{args.model}_{args.sampling_method}"
         f"_t{_float_token(args.temperature)}_mcmc{args.mcmc_steps}"
-        f"{block_suffix}{budget_suffix}{stop_suffix}_shard{args.batch_idx:02d}_seed{args.seed:02d}"
+        f"{block_suffix}{budget_suffix}{stop_suffix}{strategy_suffix}_shard{args.batch_idx:02d}_seed{args.seed:02d}"
     )
 
 
@@ -63,6 +68,13 @@ if __name__ == "__main__":
     parser.add_argument("--mcmc_steps", type=int, default=10)
     parser.add_argument("--mcmc_block_num", type=int, default=16)
     parser.add_argument("--mcmc_stop_mode", type=str, default="eos", choices=["eos", "budget"])
+    parser.add_argument("--mcmc_budget_strategy", type=str, default="restart", choices=["restart", "refine"])
+    parser.add_argument(
+        "--mcmc_selection_mode",
+        type=str,
+        default="weighted_vote",
+        choices=["last", "best_logp", "vote", "weighted_vote"],
+    )
     parser.add_argument("--sampling_method", type=str, default="power", choices=["power"])
     parser.add_argument("--max_new_tokens", type=int, default=3072)
     parser.add_argument(
@@ -87,6 +99,9 @@ if __name__ == "__main__":
 
     if args.mcmc_stop_mode == "budget" and args.max_sampling_tokens is None:
         raise ValueError("--mcmc_stop_mode budget requires --max_sampling_tokens.")
+    if args.mcmc_stop_mode != "budget" and args.mcmc_budget_strategy != "restart":
+        # The strategy is irrelevant in eos mode, but we keep the CLI simple by allowing any value.
+        pass
 
     if args.dataset != "MATH":
         raise ValueError(f"Unsupported dataset: {args.dataset}")
@@ -102,6 +117,9 @@ if __name__ == "__main__":
     method_config = {
         "block_num": args.mcmc_block_num,
         "stop_mode": args.mcmc_stop_mode,
+        "budget_strategy": args.mcmc_budget_strategy,
+        "selection_mode": args.mcmc_selection_mode,
+        "answer_extractor": parse_answer,
         "max_sampling_tokens": args.max_sampling_tokens,
     }
 
@@ -109,6 +127,7 @@ if __name__ == "__main__":
         (
             f"MCMC setup: temperature={args.temperature} mcmc_steps={args.mcmc_steps} "
             f"block_num={args.mcmc_block_num} stop_mode={args.mcmc_stop_mode} "
+            f"budget_strategy={args.mcmc_budget_strategy} selection_mode={args.mcmc_selection_mode} "
             f"max_new_tokens={args.max_new_tokens} "
             f"max_sampling_tokens={args.max_sampling_tokens}"
         ),
@@ -127,6 +146,8 @@ if __name__ == "__main__":
             "mcmc_steps": args.mcmc_steps,
             "mcmc_block_num": args.mcmc_block_num,
             "mcmc_stop_mode": args.mcmc_stop_mode,
+            "mcmc_budget_strategy": args.mcmc_budget_strategy,
+            "mcmc_selection_mode": args.mcmc_selection_mode,
             "sampling_method": args.sampling_method,
             "batch_idx": args.batch_idx,
             "seed": args.seed,
@@ -223,6 +244,8 @@ if __name__ == "__main__":
                 "power_internal_sampling_tokens": internal_sampling_tokens,
                 "power_mcmc_block_num": args.mcmc_block_num,
                 "power_mcmc_stop_mode": args.mcmc_stop_mode,
+                "power_mcmc_budget_strategy": args.mcmc_budget_strategy,
+                "power_mcmc_selection_mode": args.mcmc_selection_mode,
                 "power_budget_max_sampling_tokens": args.max_sampling_tokens,
                 "power_budget_remaining_sampling_tokens": budget_remaining_tokens,
                 "power_budget_exhausted": budget_exhausted,
@@ -291,6 +314,9 @@ if __name__ == "__main__":
         output_suffix_parts.append(f"budget{args.max_sampling_tokens}")
     if args.mcmc_stop_mode != "eos":
         output_suffix_parts.append(f"stop{args.mcmc_stop_mode}")
+        output_suffix_parts.append(args.mcmc_budget_strategy)
+        if args.mcmc_budget_strategy == "restart":
+            output_suffix_parts.append(args.mcmc_selection_mode)
     output_suffix = "" if not output_suffix_parts else "_" + "_".join(output_suffix_parts)
     output_path = os.path.join(
         save_str,

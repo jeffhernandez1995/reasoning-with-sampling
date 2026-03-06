@@ -719,6 +719,9 @@ class GenericSampler:
         prompt_token_ids = input_ids[0].detach().cpu().tolist()
         block_num = _as_int("block_num", 16)
         stop_mode = _as_str("stop_mode", "eos")
+        budget_strategy = _as_str("budget_strategy", "restart")
+        selection_mode = _as_str("selection_mode", "best_logp")
+        answer_extractor = method_config.get("answer_extractor")
         budget_config = SamplingBudgetConfig(
             max_sampling_tokens=_as_opt_int("max_sampling_tokens", None),
         )
@@ -731,6 +734,9 @@ class GenericSampler:
             max_new_tokens=max_new_tokens,
             block_num=block_num,
             stop_mode=stop_mode,
+            budget_strategy=budget_strategy,
+            selection_mode=selection_mode,
+            answer_extractor=answer_extractor,
             budget_config=budget_config,
             return_diagnostics=True,
         )
@@ -754,6 +760,8 @@ class GenericSampler:
                 "mcmc_steps": mcmc_steps,
                 "mcmc_block_num": block_num,
                 "mcmc_stop_mode": stop_mode,
+                "mcmc_budget_strategy": budget_strategy,
+                "mcmc_selection_mode": selection_mode,
                 "max_sampling_tokens": budget_config.max_sampling_tokens,
                 **diagnostics,
             },
