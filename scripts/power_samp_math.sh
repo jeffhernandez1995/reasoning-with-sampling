@@ -6,7 +6,7 @@
 #SBATCH --gres=gpu:h200:1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=26
-#SBATCH --array=0-39
+#SBATCH --array=0-9
 #SBATCH -o /scratch/%u/logs/%x-%A_%a.out
 #SBATCH -e /scratch/%u/logs/%x-%A_%a.err
 #SBATCH --mail-user=jeh16@rice.edu
@@ -16,7 +16,7 @@ set -euo pipefail
 
 # --- map array id -> (batch_idx, seed) ---
 NUM_SHARDS=5
-NUM_SEEDS=8
+NUM_SEEDS=2
 TOTAL_TASKS=$((NUM_SHARDS * NUM_SEEDS))
 if [[ "${SLURM_ARRAY_TASK_ID}" -ge "${TOTAL_TASKS}" ]]; then
   echo "SLURM_ARRAY_TASK_ID=${SLURM_ARRAY_TASK_ID} out of range for ${TOTAL_TASKS} tasks" >&2
@@ -56,7 +56,9 @@ mkdir -p "/scratch/$USER/logs" "${HF_HOME}"
 # Force run config in-script to avoid inheriting submit-shell overrides.
 MODEL="qwen_math"
 MCMC_STEPS="10"
+MCMC_STOP_MODE="budget"
 TEMP="0.25"
+MAX_SAMPLING_TOKENS="1024"
 SAVE_STR="/scratch/$USER/reasoning-with-sampling/results"
 mkdir -p "${SAVE_STR}"
 
@@ -64,10 +66,17 @@ echo "== Node =="
 hostname
 echo "SLURM_JOB_ID=${SLURM_JOB_ID} ARRAY_TASK=${SLURM_ARRAY_TASK_ID}"
 echo "BATCH_IDX=${BATCH_IDX} SEED=${SEED}"
-echo "MODEL=${MODEL} MCMC_STEPS=${MCMC_STEPS} TEMP=${TEMP}"
+echo "MODEL=${MODEL} MCMC_STEPS=${MCMC_STEPS} MCMC_STOP_MODE=${MCMC_STOP_MODE} TEMP=${TEMP}"
+echo "MAX_SAMPLING_TOKENS=${MAX_SAMPLING_TOKENS:-unset}"
 echo "REPO_ROOT=${REPO_ROOT}"
 echo "SAVE_STR=${SAVE_STR}"
 echo
+
+EXTRA_ARG_STR=""
+if [[ -n "${MAX_SAMPLING_TOKENS}" ]]; then
+  printf -v EXTRA_ARG_STR '%s --max_sampling_tokens %q' "${EXTRA_ARG_STR}" "${MAX_SAMPLING_TOKENS}"
+fi
+printf -v EXTRA_ARG_STR '%s --mcmc_stop_mode %q' "${EXTRA_ARG_STR}" "${MCMC_STOP_MODE}"
 
 srun --ntasks=1 bash -lc "
 source \"$HOME/miniconda3/etc/profile.d/conda.sh\" &&
@@ -89,5 +98,5 @@ python \"${REPO_ROOT}/power_samp_math.py\" \
   --temp \"${TEMP}\" \
   --seed \"${SEED}\" \
   --model \"${MODEL}\" \
-  --save_str \"${SAVE_STR}\"
+  --save_str \"${SAVE_STR}\"${EXTRA_ARG_STR}
 "

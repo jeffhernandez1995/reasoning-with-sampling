@@ -17,6 +17,7 @@ from algos.power_sampling_dtr import PowerSamplerDTRConfig, dtr_power_sample
 from algos.power_sampling_mcmc import AutoregressiveSampler, mcmc_power_samp
 from algos.power_sampling_smc import PowerSamplerSMCConfig, smc_power_sample
 from algos.power_sampling_tilted_cgf import PowerSamplerTiltedCGFConfig, tilted_cgf_power_sample
+from sampling_budget import SamplingBudgetConfig
 
 
 MODEL_NAME_BY_ALIAS = {
@@ -699,7 +700,28 @@ class GenericSampler:
         max_new_tokens: int,
         method_config: Optional[Dict[str, Any]] = None,
     ) -> SamplingOutput:
+        method_config = method_config or {}
+
+        def _as_int(name: str, default: int) -> int:
+            value = method_config.get(name, default)
+            return int(value)
+
+        def _as_opt_int(name: str, default: Optional[int]) -> Optional[int]:
+            value = method_config.get(name, default)
+            if value is None:
+                return None
+            return int(value)
+
+        def _as_str(name: str, default: str) -> str:
+            value = method_config.get(name, default)
+            return str(value)
+
         prompt_token_ids = input_ids[0].detach().cpu().tolist()
+        block_num = _as_int("block_num", 16)
+        stop_mode = _as_str("stop_mode", "eos")
+        budget_config = SamplingBudgetConfig(
+            max_sampling_tokens=_as_opt_int("max_sampling_tokens", None),
+        )
         start = perf_counter()
         sampled_token_ids, _, _, acceptance_ratio, diagnostics = mcmc_power_samp(
             self.autoreg_sampler,
@@ -707,6 +729,9 @@ class GenericSampler:
             temperature,
             mcmc_steps,
             max_new_tokens=max_new_tokens,
+            block_num=block_num,
+            stop_mode=stop_mode,
+            budget_config=budget_config,
             return_diagnostics=True,
         )
         latency_seconds = perf_counter() - start
@@ -727,6 +752,9 @@ class GenericSampler:
                 "acceptance_ratio": acceptance_ratio,
                 "temperature": temperature,
                 "mcmc_steps": mcmc_steps,
+                "mcmc_block_num": block_num,
+                "mcmc_stop_mode": stop_mode,
+                "max_sampling_tokens": budget_config.max_sampling_tokens,
                 **diagnostics,
             },
             full_completion=full_completion,

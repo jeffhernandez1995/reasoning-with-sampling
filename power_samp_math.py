@@ -38,10 +38,13 @@ def _float_token(value: float) -> str:
 
 
 def default_wandb_run_name(args) -> str:
+    budget_suffix = "" if args.max_sampling_tokens is None else f"_budget{args.max_sampling_tokens}"
+    block_suffix = "" if args.mcmc_block_num == 16 else f"_b{args.mcmc_block_num}"
+    stop_suffix = "" if args.mcmc_stop_mode == "eos" else f"_stop{args.mcmc_stop_mode}"
     return (
         f"{args.dataset.lower()}_{args.model}_{args.sampling_method}"
         f"_t{_float_token(args.temperature)}_mcmc{args.mcmc_steps}"
-        f"_shard{args.batch_idx:02d}_seed{args.seed:02d}"
+        f"{block_suffix}{budget_suffix}{stop_suffix}_shard{args.batch_idx:02d}_seed{args.seed:02d}"
     )
 
 
@@ -58,8 +61,18 @@ if __name__ == "__main__":
     parser.add_argument("--dataset", type=str, default="MATH")
     parser.add_argument("--cot", type=parse_bool, default=True)
     parser.add_argument("--mcmc_steps", type=int, default=10)
+    parser.add_argument("--mcmc_block_num", type=int, default=16)
+    parser.add_argument("--mcmc_stop_mode", type=str, default="eos", choices=["eos", "budget"])
     parser.add_argument("--sampling_method", type=str, default="power", choices=["power"])
     parser.add_argument("--max_new_tokens", type=int, default=3072)
+    parser.add_argument(
+        "--max_sampling_tokens",
+        "--max_total_effort_tokens",
+        dest="max_sampling_tokens",
+        type=int,
+        default=None,
+        help="Hard cap on sampler compute tokens (`sampling_tokens` = output + internal proposal tokens).",
+    )
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--batch_idx", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
@@ -72,6 +85,9 @@ if __name__ == "__main__":
 
     random.seed(args.seed)
 
+    if args.mcmc_stop_mode == "budget" and args.max_sampling_tokens is None:
+        raise ValueError("--mcmc_stop_mode budget requires --max_sampling_tokens.")
+
     if args.dataset != "MATH":
         raise ValueError(f"Unsupported dataset: {args.dataset}")
 
@@ -83,6 +99,21 @@ if __name__ == "__main__":
 
     model, tokenizer = load_model_and_tokenizer(args.model, args.device, trust_remote_code=True)
     sampler = GenericSampler(model, tokenizer, args.device)
+    method_config = {
+        "block_num": args.mcmc_block_num,
+        "stop_mode": args.mcmc_stop_mode,
+        "max_sampling_tokens": args.max_sampling_tokens,
+    }
+
+    print(
+        (
+            f"MCMC setup: temperature={args.temperature} mcmc_steps={args.mcmc_steps} "
+            f"block_num={args.mcmc_block_num} stop_mode={args.mcmc_stop_mode} "
+            f"max_new_tokens={args.max_new_tokens} "
+            f"max_sampling_tokens={args.max_sampling_tokens}"
+        ),
+        flush=True,
+    )
 
     wandb_logger = WandbSampleLogger(
         project=args.wandb_project,
@@ -94,10 +125,13 @@ if __name__ == "__main__":
             "model": args.model,
             "temperature": args.temperature,
             "mcmc_steps": args.mcmc_steps,
+            "mcmc_block_num": args.mcmc_block_num,
+            "mcmc_stop_mode": args.mcmc_stop_mode,
             "sampling_method": args.sampling_method,
             "batch_idx": args.batch_idx,
             "seed": args.seed,
             "max_new_tokens": args.max_new_tokens,
+            "max_sampling_tokens": args.max_sampling_tokens,
             "wandb_run_name": wandb_run_name,
         },
     )
@@ -130,6 +164,7 @@ if __name__ == "__main__":
             temperature=args.temperature,
             mcmc_steps=args.mcmc_steps,
             max_new_tokens=args.max_new_tokens,
+            method_config=method_config,
         )
 
         naive_answer = parse_answer(naive_sample.completion)
@@ -149,6 +184,9 @@ if __name__ == "__main__":
         sampling_tokens = method_sample.metadata.get("sampling_tokens")
         output_tokens = method_sample.metadata.get("output_tokens")
         internal_sampling_tokens = method_sample.metadata.get("internal_sampling_tokens")
+        budget_remaining_tokens = method_sample.metadata.get("budget_remaining_sampling_tokens")
+        budget_exhausted = method_sample.metadata.get("budget_exhausted")
+        budget_stop_reason = method_sample.metadata.get("budget_stop_reason")
         total_base_seconds += base_seconds
         total_temp_seconds += temp_seconds
         total_power_seconds += power_seconds
@@ -183,6 +221,12 @@ if __name__ == "__main__":
                 "power_sampling_tokens": sampling_tokens,
                 "power_output_tokens": output_tokens,
                 "power_internal_sampling_tokens": internal_sampling_tokens,
+                "power_mcmc_block_num": args.mcmc_block_num,
+                "power_mcmc_stop_mode": args.mcmc_stop_mode,
+                "power_budget_max_sampling_tokens": args.max_sampling_tokens,
+                "power_budget_remaining_sampling_tokens": budget_remaining_tokens,
+                "power_budget_exhausted": budget_exhausted,
+                "power_budget_stop_reason": budget_stop_reason,
                 "naive_reward": naive_reward,
                 "std_reward": std_reward,
                 "mcmc_reward": method_reward,
@@ -208,6 +252,8 @@ if __name__ == "__main__":
                 "sampling/power_sampling_tokens": sampling_tokens,
                 "sampling/power_output_tokens": output_tokens,
                 "sampling/power_internal_sampling_tokens": internal_sampling_tokens,
+                "sampling/power_budget_remaining_sampling_tokens": budget_remaining_tokens,
+                "sampling/power_budget_exhausted": int(bool(budget_exhausted)),
             },
             step=step_idx,
         )
@@ -232,12 +278,26 @@ if __name__ == "__main__":
                 "power_acceptance_ratio": acceptance_ratio,
                 "power_sampling_tokens": sampling_tokens,
                 "power_output_tokens": output_tokens,
+                "power_budget_remaining_sampling_tokens": budget_remaining_tokens,
+                "power_budget_exhausted": budget_exhausted,
+                "power_budget_stop_reason": budget_stop_reason,
             }
         )
 
+    output_suffix_parts = []
+    if args.mcmc_block_num != 16:
+        output_suffix_parts.append(f"b{args.mcmc_block_num}")
+    if args.max_sampling_tokens is not None:
+        output_suffix_parts.append(f"budget{args.max_sampling_tokens}")
+    if args.mcmc_stop_mode != "eos":
+        output_suffix_parts.append(f"stop{args.mcmc_stop_mode}")
+    output_suffix = "" if not output_suffix_parts else "_" + "_".join(output_suffix_parts)
     output_path = os.path.join(
         save_str,
-        f"{args.model}_math_base_power_samp_results_{args.mcmc_steps}_{args.temperature}_{args.batch_idx}_{args.seed}.csv",
+        (
+            f"{args.model}_math_base_power_samp_results_"
+            f"{args.mcmc_steps}_{args.temperature}{output_suffix}_{args.batch_idx}_{args.seed}.csv"
+        ),
     )
     pd.DataFrame(results).to_csv(output_path, index=False)
     wandb_logger.log_file(output_path)
