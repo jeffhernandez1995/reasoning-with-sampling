@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 
 @dataclass
@@ -70,3 +70,48 @@ class SamplingBudgetTracker:
             "budget_remaining_sampling_tokens": self.remaining_sampling_tokens(),
             "budget_exhausted": self.exhausted(),
         }
+
+
+def fit_batched_sampling_plan(
+    *,
+    num_prefixes: int,
+    samples_per_prefix: int,
+    max_tokens_per_sample: int,
+    remaining_sampling_tokens: Optional[int],
+) -> Tuple[int, int]:
+    """Fit a batched sampling request under a hard token budget.
+
+    Returns `(samples_per_prefix, max_tokens_per_sample)` such that the worst
+    case token usage
+
+      num_prefixes * samples_per_prefix * max_tokens_per_sample
+
+    does not exceed `remaining_sampling_tokens`. We preserve the requested
+    per-sample token horizon first and reduce the number of samples before
+    shortening individual samples.
+    """
+
+    prefixes = max(int(num_prefixes), 0)
+    samples = max(int(samples_per_prefix), 0)
+    tokens = max(int(max_tokens_per_sample), 0)
+    if prefixes <= 0 or samples <= 0 or tokens <= 0:
+        return 0, 0
+
+    if remaining_sampling_tokens is None:
+        return samples, tokens
+
+    remaining = max(int(remaining_sampling_tokens), 0)
+    if remaining <= 0:
+        return 0, 0
+
+    max_full_samples = remaining // (prefixes * tokens)
+    if max_full_samples >= samples:
+        return samples, tokens
+    if max_full_samples >= 1:
+        return max_full_samples, tokens
+
+    max_shortened_tokens = remaining // prefixes
+    if max_shortened_tokens >= 1:
+        return 1, min(tokens, max_shortened_tokens)
+
+    return 0, 0

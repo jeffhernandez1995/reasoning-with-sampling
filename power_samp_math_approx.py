@@ -88,10 +88,20 @@ def default_wandb_run_name(args) -> str:
         if args.sampling_method == "power_cumulant"
         else f"m{args.rollouts_per_candidate}"
     )
+    budget_suffix = ""
+    stop_suffix = ""
+    strategy_suffix = ""
+    if args.sampling_method == "power_approx":
+        budget_suffix = "" if args.max_sampling_tokens is None else f"_budget{args.max_sampling_tokens}"
+        stop_suffix = "" if args.approx_stop_mode == "eos" else f"_stop{args.approx_stop_mode}"
+        if args.approx_stop_mode == "budget":
+            strategy_suffix = f"_{args.approx_budget_strategy}"
+            if args.approx_budget_strategy == "restart":
+                strategy_suffix += f"_{args.approx_selection_mode}"
     return (
         f"{args.dataset.lower()}_{args.model}_{args.sampling_method}"
         f"_t{_float_token(args.temperature)}_k{args.top_k}"
-        f"_{rollout_tag}_b{args.block_size}"
+        f"_{rollout_tag}_b{args.block_size}{budget_suffix}{stop_suffix}{strategy_suffix}"
         f"_shard{args.batch_idx:02d}_seed{args.seed:02d}"
     )
 
@@ -110,6 +120,11 @@ def build_method_config(args, eos_token_id: Optional[int]) -> Dict[str, Any]:
             {
                 "rollouts_per_candidate": args.rollouts_per_candidate,
                 "use_jackknife": args.use_jackknife,
+                "stop_mode": args.approx_stop_mode,
+                "budget_strategy": args.approx_budget_strategy,
+                "selection_mode": args.approx_selection_mode,
+                "answer_extractor": parse_answer,
+                "max_sampling_tokens": args.max_sampling_tokens,
             }
         )
     elif args.sampling_method == "power_cumulant":
@@ -183,6 +198,22 @@ if __name__ == "__main__":
     parser.add_argument("--proposal_temperature", type=float, default=None)
     parser.add_argument("--proposal_top_p", type=float, default=1.0)
     parser.add_argument("--proposal_top_k", type=int, default=None)
+    parser.add_argument("--approx_stop_mode", type=str, default="eos", choices=["eos", "budget"])
+    parser.add_argument("--approx_budget_strategy", type=str, default="restart", choices=["restart"])
+    parser.add_argument(
+        "--approx_selection_mode",
+        type=str,
+        default="weighted_vote",
+        choices=["last", "best_logp", "vote", "weighted_vote"],
+    )
+    parser.add_argument(
+        "--max_sampling_tokens",
+        "--max_total_effort_tokens",
+        dest="max_sampling_tokens",
+        type=int,
+        default=None,
+        help="Hard cap on sampler compute tokens (`sampling_tokens` = output + internal proposal tokens).",
+    )
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--batch_idx", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
@@ -199,6 +230,13 @@ if __name__ == "__main__":
 
     random.seed(args.seed)
 
+    if args.sampling_method != "power_approx" and args.approx_stop_mode != "eos":
+        raise ValueError(f"{args.sampling_method} does not support --approx_stop_mode yet.")
+    if args.sampling_method != "power_approx" and args.max_sampling_tokens is not None:
+        raise ValueError(f"{args.sampling_method} does not support --max_sampling_tokens yet.")
+    if args.approx_stop_mode == "budget" and args.max_sampling_tokens is None:
+        raise ValueError("--approx_stop_mode budget requires --max_sampling_tokens.")
+
     if args.dataset != "MATH":
         raise ValueError(f"Unsupported dataset: {args.dataset}")
 
@@ -213,6 +251,19 @@ if __name__ == "__main__":
 
     method_config = build_method_config(args, tokenizer.eos_token_id)
 
+    print(
+        (
+            f"Approx setup: method={args.sampling_method} temperature={args.temperature} "
+            f"top_k={args.top_k} candidate_pool_size={args.candidate_pool_size} "
+            f"rollouts_per_candidate={args.rollouts_per_candidate} block_size={args.block_size} "
+            f"approx_stop_mode={args.approx_stop_mode} "
+            f"approx_budget_strategy={args.approx_budget_strategy} "
+            f"approx_selection_mode={args.approx_selection_mode} "
+            f"max_new_tokens={args.max_new_tokens} max_sampling_tokens={args.max_sampling_tokens}"
+        ),
+        flush=True,
+    )
+
     wandb_logger = WandbSampleLogger(
         project=args.wandb_project,
         entity=args.wandb_entity,
@@ -226,7 +277,7 @@ if __name__ == "__main__":
             "batch_idx": args.batch_idx,
             "seed": args.seed,
             "max_new_tokens": args.max_new_tokens,
-            **{k: v for k, v in method_config.items() if k not in {"eos_token_id"}},
+            **{k: v for k, v in method_config.items() if k not in {"eos_token_id", "answer_extractor"}},
             "wandb_run_name": wandb_run_name,
         },
     )
@@ -243,13 +294,23 @@ if __name__ == "__main__":
         )
         sys.exit(0)
 
+    output_suffix_parts = [
+        f"k{args.top_k}",
+        f"m{args.rollouts_per_candidate}",
+        f"b{args.block_size}",
+        str(args.temperature),
+    ]
+    if args.sampling_method == "power_approx" and args.max_sampling_tokens is not None:
+        output_suffix_parts.append(f"budget{args.max_sampling_tokens}")
+    if args.sampling_method == "power_approx" and args.approx_stop_mode != "eos":
+        output_suffix_parts.append(f"stop{args.approx_stop_mode}")
+        output_suffix_parts.append(args.approx_budget_strategy)
+        if args.approx_budget_strategy == "restart":
+            output_suffix_parts.append(args.approx_selection_mode)
+    output_suffix_parts.extend([str(args.batch_idx), str(args.seed)])
     output_path = os.path.join(
         save_str,
-        (
-            f"{args.model}_math_base_{args.sampling_method}_results_"
-            f"k{args.top_k}_m{args.rollouts_per_candidate}_"
-            f"b{args.block_size}_{args.temperature}_{args.batch_idx}_{args.seed}.csv"
-        ),
+        f"{args.model}_math_base_{args.sampling_method}_results_{'_'.join(output_suffix_parts)}.csv",
     )
     partial_output_path = f"{output_path}.partial"
 
@@ -374,6 +435,15 @@ if __name__ == "__main__":
             approx_sampling_tokens = method_sample.metadata.get("sampling_tokens")
             approx_output_tokens = method_sample.metadata.get("output_tokens")
             approx_internal_sampling_tokens = method_sample.metadata.get("internal_sampling_tokens")
+            approx_stop_mode = method_sample.metadata.get("approx_stop_mode")
+            approx_budget_strategy = method_sample.metadata.get("approx_budget_strategy")
+            approx_selection_mode = method_sample.metadata.get("approx_selection_mode")
+            approx_budget_remaining_tokens = method_sample.metadata.get("budget_remaining_sampling_tokens")
+            approx_budget_exhausted = method_sample.metadata.get("budget_exhausted")
+            approx_budget_stop_reason = method_sample.metadata.get("budget_stop_reason")
+            approx_chains_started = method_sample.metadata.get("approx_chains_started")
+            approx_completed_candidates = method_sample.metadata.get("approx_completed_candidates")
+            approx_selected_candidate_source = method_sample.metadata.get("approx_selected_candidate_source")
             method_specific_config = (
                 method_sample.metadata.get("approx_config")
                 or method_sample.metadata.get("cumulant_config")
@@ -413,6 +483,18 @@ if __name__ == "__main__":
                     "approx_sampling_tokens": approx_sampling_tokens,
                     "approx_output_tokens": approx_output_tokens,
                     "approx_internal_sampling_tokens": approx_internal_sampling_tokens,
+                    "approx_stop_mode": approx_stop_mode,
+                    "approx_budget_strategy": approx_budget_strategy,
+                    "approx_selection_mode": approx_selection_mode,
+                    "approx_budget_remaining_sampling_tokens": approx_budget_remaining_tokens,
+                    "approx_budget_exhausted": approx_budget_exhausted,
+                    "approx_budget_stop_reason": approx_budget_stop_reason,
+                    "approx_chains_started": approx_chains_started,
+                    "approx_completed_candidates": approx_completed_candidates,
+                    "approx_selected_candidate_source": approx_selected_candidate_source,
+                    "power_sampling_tokens": approx_sampling_tokens,
+                    "power_output_tokens": approx_output_tokens,
+                    "power_internal_sampling_tokens": approx_internal_sampling_tokens,
                     "approx_config": json.dumps(method_specific_config),
                     "naive_reward": naive_reward,
                     "std_reward": std_reward,
@@ -439,6 +521,9 @@ if __name__ == "__main__":
                     "sampling/approx_sampling_tokens": approx_sampling_tokens,
                     "sampling/approx_output_tokens": approx_output_tokens,
                     "sampling/approx_internal_sampling_tokens": approx_internal_sampling_tokens,
+                    "sampling/approx_budget_remaining_sampling_tokens": approx_budget_remaining_tokens,
+                    "sampling/approx_budget_exhausted": int(bool(approx_budget_exhausted)),
+                    "sampling/power_sampling_tokens": approx_sampling_tokens,
                     "reward/naive": naive_reward,
                     "reward/std": std_reward,
                     "reward/mcmc": method_reward,
@@ -467,6 +552,10 @@ if __name__ == "__main__":
                     "approx_rollouts": approx_rollouts,
                     "approx_sampling_tokens": approx_sampling_tokens,
                     "approx_output_tokens": approx_output_tokens,
+                    "approx_stop_mode": approx_stop_mode,
+                    "approx_budget_strategy": approx_budget_strategy,
+                    "approx_selection_mode": approx_selection_mode,
+                    "approx_budget_stop_reason": approx_budget_stop_reason,
                 }
             )
 

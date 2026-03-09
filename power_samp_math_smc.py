@@ -83,10 +83,18 @@ def format_cuda_snapshot(snapshot: Dict[str, float]) -> str:
 
 
 def default_wandb_run_name(args) -> str:
+    budget_suffix = "" if args.max_sampling_tokens is None else f"_budget{args.max_sampling_tokens}"
+    stop_suffix = "" if args.smc_stop_mode == "eos" else f"_stop{args.smc_stop_mode}"
+    strategy_suffix = ""
+    if args.smc_stop_mode == "budget":
+        strategy_suffix = f"_{args.smc_budget_strategy}"
+        if args.smc_budget_strategy == "restart":
+            strategy_suffix += f"_{args.smc_selection_mode}"
     return (
         f"{args.dataset.lower()}_{args.model}_{args.sampling_method}"
         f"_t{_float_token(args.temperature)}_n{args.num_particles}"
         f"_ess{_float_token(args.ess_threshold)}_ri{args.resample_interval}"
+        f"{budget_suffix}{stop_suffix}{strategy_suffix}"
         f"_shard{args.batch_idx:02d}_seed{args.seed:02d}"
     )
 
@@ -127,6 +135,22 @@ if __name__ == "__main__":
     parser.add_argument("--auxiliary_temperature", type=float, default=None)
     parser.add_argument("--max_logw_step", type=float, default=50.0)
     parser.add_argument("--stop_on_all_eos", type=parse_bool, default=True)
+    parser.add_argument("--smc_stop_mode", type=str, default="eos", choices=["eos", "budget"])
+    parser.add_argument("--smc_budget_strategy", type=str, default="restart", choices=["restart"])
+    parser.add_argument(
+        "--smc_selection_mode",
+        type=str,
+        default="weighted_vote",
+        choices=["last", "best_logp", "vote", "weighted_vote"],
+    )
+    parser.add_argument(
+        "--max_sampling_tokens",
+        "--max_total_effort_tokens",
+        dest="max_sampling_tokens",
+        type=int,
+        default=None,
+        help="Hard cap on sampler compute tokens (`sampling_tokens` = output + internal proposal tokens).",
+    )
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--batch_idx", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
@@ -142,6 +166,9 @@ if __name__ == "__main__":
     wandb_run_name = args.wandb_run_name or default_wandb_run_name(args)
 
     random.seed(args.seed)
+
+    if args.smc_stop_mode == "budget" and args.max_sampling_tokens is None:
+        raise ValueError("--smc_stop_mode budget requires --max_sampling_tokens.")
 
     if args.dataset != "MATH":
         raise ValueError(f"Unsupported dataset: {args.dataset}")
@@ -168,10 +195,28 @@ if __name__ == "__main__":
         "auxiliary_temperature": args.auxiliary_temperature,
         "max_logw_step": args.max_logw_step,
         "stop_on_all_eos": args.stop_on_all_eos,
+        "stop_mode": args.smc_stop_mode,
+        "budget_strategy": args.smc_budget_strategy,
+        "selection_mode": args.smc_selection_mode,
+        "answer_extractor": parse_answer,
+        "max_sampling_tokens": args.max_sampling_tokens,
         "seed": args.seed,
         "eos_token_id": tokenizer.eos_token_id,
         "pad_token_id": tokenizer.pad_token_id,
     }
+
+    print(
+        (
+            f"SMC setup: method={args.sampling_method} temperature={args.temperature} "
+            f"num_particles={args.num_particles} ess_threshold={args.ess_threshold} "
+            f"resample_interval={args.resample_interval} resample_method={args.resample_method} "
+            f"smc_stop_mode={args.smc_stop_mode} "
+            f"smc_budget_strategy={args.smc_budget_strategy} "
+            f"smc_selection_mode={args.smc_selection_mode} "
+            f"max_new_tokens={args.max_new_tokens} max_sampling_tokens={args.max_sampling_tokens}"
+        ),
+        flush=True,
+    )
 
     wandb_logger = WandbSampleLogger(
         project=args.wandb_project,
@@ -186,7 +231,7 @@ if __name__ == "__main__":
             "batch_idx": args.batch_idx,
             "seed": args.seed,
             "max_new_tokens": args.max_new_tokens,
-            **{k: v for k, v in smc_method_config.items() if k not in {"eos_token_id", "pad_token_id"}},
+            **{k: v for k, v in smc_method_config.items() if k not in {"eos_token_id", "pad_token_id", "answer_extractor"}},
             "wandb_run_name": wandb_run_name,
         },
     )
@@ -203,13 +248,23 @@ if __name__ == "__main__":
         )
         sys.exit(0)
 
+    output_suffix_parts = [
+        f"n{args.num_particles}",
+        f"ess{args.ess_threshold}",
+        f"ri{args.resample_interval}",
+        f"t{args.temperature}",
+    ]
+    if args.max_sampling_tokens is not None:
+        output_suffix_parts.append(f"budget{args.max_sampling_tokens}")
+    if args.smc_stop_mode != "eos":
+        output_suffix_parts.append(f"stop{args.smc_stop_mode}")
+        output_suffix_parts.append(args.smc_budget_strategy)
+        if args.smc_budget_strategy == "restart":
+            output_suffix_parts.append(args.smc_selection_mode)
+    output_suffix_parts.extend([str(args.batch_idx), str(args.seed)])
     output_path = os.path.join(
         save_str,
-        (
-            f"{args.model}_math_base_{args.sampling_method}_results_"
-            f"n{args.num_particles}_ess{args.ess_threshold}_ri{args.resample_interval}_"
-            f"t{args.temperature}_{args.batch_idx}_{args.seed}.csv"
-        ),
+        f"{args.model}_math_base_{args.sampling_method}_results_{'_'.join(output_suffix_parts)}.csv",
     )
     partial_output_path = f"{output_path}.partial"
 
@@ -324,6 +379,9 @@ if __name__ == "__main__":
             avg_smc_seconds = total_smc_seconds / max(total_samples, 1)
 
             method_metadata = method_sample.metadata
+            smc_sampling_tokens = method_metadata.get("sampling_tokens")
+            smc_output_tokens = method_metadata.get("output_tokens")
+            smc_internal_sampling_tokens = method_metadata.get("internal_sampling_tokens")
 
             results.append(
                 {
@@ -358,6 +416,9 @@ if __name__ == "__main__":
                     "std_reward": std_reward,
                     "mcmc_reward": method_reward,
                     "smc_reward": method_reward,
+                    "power_sampling_tokens": smc_sampling_tokens,
+                    "power_output_tokens": smc_output_tokens,
+                    "power_internal_sampling_tokens": smc_internal_sampling_tokens,
                     **{f"smc_{k}": v for k, v in method_metadata.items()},
                 }
             )
@@ -381,6 +442,7 @@ if __name__ == "__main__":
                     "sampling/smc_output_tokens": method_metadata.get("output_tokens"),
                     "sampling/smc_sampling_tokens": method_metadata.get("sampling_tokens"),
                     "sampling/smc_internal_sampling_tokens": method_metadata.get("internal_sampling_tokens"),
+                    "sampling/power_sampling_tokens": smc_sampling_tokens,
                     "sampling/smc_num_resamples": method_metadata.get("num_resamples"),
                     "sampling/smc_avg_ess": method_metadata.get("avg_ess"),
                     "sampling/smc_final_ess": method_metadata.get("final_ess"),
@@ -408,6 +470,7 @@ if __name__ == "__main__":
                     "smc_steps": method_metadata.get("steps"),
                     "smc_output_tokens": method_metadata.get("output_tokens"),
                     "smc_sampling_tokens": method_metadata.get("sampling_tokens"),
+                    "smc_budget_stop_reason": method_metadata.get("budget_stop_reason"),
                     "smc_num_resamples": method_metadata.get("num_resamples"),
                     "smc_avg_ess": method_metadata.get("avg_ess"),
                 }

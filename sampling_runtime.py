@@ -790,6 +790,10 @@ class GenericSampler:
                 return None
             return int(value)
 
+        def _as_str(name: str, default: str) -> str:
+            value = method_config.get(name, default)
+            return str(value)
+
         def _as_bool(name: str, default: bool) -> bool:
             value = method_config.get(name, default)
             if isinstance(value, bool):
@@ -809,6 +813,13 @@ class GenericSampler:
         prompt_token_ids = input_ids[0].detach().cpu().tolist()
         eos_id = method_config.get("eos_token_id", self.tokenizer.eos_token_id)
         seed_value = method_config.get("seed")
+        stop_mode = _as_str("stop_mode", "eos")
+        budget_strategy = _as_str("budget_strategy", "restart")
+        selection_mode = _as_str("selection_mode", "best_logp")
+        answer_extractor = method_config.get("answer_extractor")
+        budget_config = SamplingBudgetConfig(
+            max_sampling_tokens=_as_opt_int("max_sampling_tokens", None),
+        )
         rng = np.random.default_rng(seed=seed_value)
 
         start = perf_counter()
@@ -819,6 +830,12 @@ class GenericSampler:
             max_new_tokens=max_new_tokens,
             eos_token_id=eos_id,
             rng=rng,
+            stop_mode=stop_mode,
+            budget_strategy=budget_strategy,
+            selection_mode=selection_mode,
+            answer_extractor=answer_extractor,
+            decode_tokens=lambda token_ids: self.tokenizer.decode(token_ids, skip_special_tokens=True),
+            budget_config=budget_config,
         )
         latency_seconds = perf_counter() - start
 
@@ -832,6 +849,10 @@ class GenericSampler:
         metadata: Dict[str, Any] = {
             "temperature": temperature,
             "approx_config": asdict(cfg),
+            "approx_stop_mode": stop_mode,
+            "approx_budget_strategy": budget_strategy,
+            "approx_selection_mode": selection_mode,
+            "max_sampling_tokens": budget_config.max_sampling_tokens,
         }
         metadata.update(diag)
 
@@ -964,6 +985,10 @@ class GenericSampler:
                 return None
             return float(value)
 
+        def _as_str(name: str, default: str) -> str:
+            value = method_config.get(name, default)
+            return str(value)
+
         def _as_bool(name: str, default: bool) -> bool:
             value = method_config.get(name, default)
             if isinstance(value, bool):
@@ -1058,6 +1083,10 @@ class GenericSampler:
                 return None
             return float(value)
 
+        def _as_str(name: str, default: str) -> str:
+            value = method_config.get(name, default)
+            return str(value)
+
         def _as_bool(name: str, default: bool) -> bool:
             value = method_config.get(name, default)
             if isinstance(value, bool):
@@ -1084,6 +1113,13 @@ class GenericSampler:
         prompt_token_ids = input_ids[0].detach().cpu().tolist()
         eos_id = method_config.get("eos_token_id", self.tokenizer.eos_token_id)
         pad_id = method_config.get("pad_token_id", self._pad_token_id)
+        stop_mode = _as_str("stop_mode", "eos")
+        budget_strategy = _as_str("budget_strategy", "restart")
+        selection_mode = _as_str("selection_mode", "best_logp")
+        answer_extractor = method_config.get("answer_extractor")
+        budget_config = SamplingBudgetConfig(
+            max_sampling_tokens=_as_opt_int("max_sampling_tokens", None),
+        )
 
         start = perf_counter()
         sampled_token_ids, diag = smc_power_sample(
@@ -1095,6 +1131,12 @@ class GenericSampler:
             max_new_tokens=max_new_tokens,
             eos_token_id=eos_id,
             pad_token_id=pad_id,
+            stop_mode=stop_mode,
+            budget_strategy=budget_strategy,
+            selection_mode=selection_mode,
+            answer_extractor=answer_extractor,
+            decode_tokens=lambda token_ids: self.tokenizer.decode(token_ids, skip_special_tokens=True),
+            budget_config=budget_config,
         )
         latency_seconds = perf_counter() - start
 
@@ -1108,6 +1150,10 @@ class GenericSampler:
         metadata: Dict[str, Any] = {
             "temperature": float(temperature),
             "smc_config": asdict(cfg),
+            "smc_stop_mode": stop_mode,
+            "smc_budget_strategy": budget_strategy,
+            "smc_selection_mode": selection_mode,
+            "max_sampling_tokens": budget_config.max_sampling_tokens,
         }
         metadata.update(diag)
 
